@@ -1,0 +1,24 @@
+services:
+  signal-api:
+    image: bbernhard/signal-cli-rest-api:latest
+    environment:
+      - MODE=json-rpc
+    volumes:
+      # :Z relabels the dir for SELinux (Fedora); harmless elsewhere.
+      - ./data/signal-cli:/home/.local/share/signal-cli:Z
+    ports:
+      # Only reachable from this machine, needed for linking/setup via curl.
+      - "127.0.0.1:8080:8080"
+    restart: unless-stopped
+
+  bot:
+    build: .
+    env_file: .env
+    environment:
+      - SIGNAL_API_URL=http://signal-api:8080
+      - DB_PATH=/data/messages.db
+    volumes:
+      - ./data/bot:/data:Z
+    depends_on:
+      - signal-api
+    restart: unless-stopped
