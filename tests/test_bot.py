@@ -4,7 +4,8 @@ import json
 import httpx
 import pytest
 
-from tldr_bot.bot import TldrBot, TldrCommand, build_transcript, parse_command
+from tldr_bot.bot import TldrBot, TldrCommand, build_transcript, is_macka_command, parse_command
+from tldr_bot.cats import CatClient, CatError
 from tldr_bot.config import Config, normalize_group_id
 from tldr_bot.llm import LLMClient, LLMError
 from tldr_bot.signal_api import (
@@ -12,6 +13,7 @@ from tldr_bot.signal_api import (
     GroupEdit,
     GroupMessage,
     Mention,
+    SignalClient,
     parse_event,
     render_mentions,
     to_rest_group_id,
@@ -54,6 +56,14 @@ def group_data(message="hi", ts=1000, **extra):
 )
 def test_parse_command(text, expected):
     assert parse_command(text) == expected
+
+
+@pytest.mark.parametrize(
+    "text, expected",
+    [("/macka", True), ("  /MACKA ", True), ("/macka 3", False), ("/mackax", False), ("daj /macka", False)],
+)
+def test_is_macka_command(text, expected):
+    assert is_macka_command(text) is expected
 
 
 # --- envelope parsing --------------------------------------------------------
@@ -158,17 +168,57 @@ async def test_llm_error():
         await llm.summarize("x")
 
 
+# --- cat client --------------------------------------------------------------
+
+async def test_random_cat():
+    cats = CatClient("http://cats/macka")
+    cats._http._transport = httpx.MockTransport(
+        lambda r: httpx.Response(200, content=b"JPEG", headers={"content-type": "image/jpeg"})
+    )
+    assert await cats.random_cat() == ("image/jpeg", b"JPEG")
+
+
+async def test_random_cat_rejects_non_image():
+    cats = CatClient("http://cats/macka")
+    cats._http._transport = httpx.MockTransport(lambda r: httpx.Response(200, text="<html>"))
+    with pytest.raises(CatError, match="Expected an image"):
+        await cats.random_cat()
+
+
+async def test_send_group_with_attachment():
+    bodies = []
+
+    def handler(request: httpx.Request):
+        bodies.append(json.loads(request.content))
+        return httpx.Response(201, json={})
+
+    signal = SignalClient("http://signal", "+420999")
+    signal._http._transport = httpx.MockTransport(handler)
+    await signal.send_group(GROUP, "cat", attachments=[("image/jpeg", b"JPEG")])
+    assert bodies[0]["base64_attachments"] == ["data:image/jpeg;base64,SlBFRw=="]
+
+
 # --- end to end through the bot ----------------------------------------------
 
 class FakeSignal:
     def __init__(self):
         self.sent = []
 
-    async def send_group(self, group_id, text, **quote):
-        self.sent.append((group_id, text, quote))
+    async def send_group(self, group_id, text, **kwargs):
+        self.sent.append((group_id, text, kwargs))
 
     async def set_typing(self, group_id, typing):
         pass
+
+
+class FakeCats:
+    def __init__(self, error=None):
+        self.error = error
+
+    async def random_cat(self):
+        if self.error:
+            raise self.error
+        return "image/jpeg", b"JPEG"
 
 
 class FakeLLM:
@@ -188,7 +238,7 @@ def make_bot(**overrides):
         allowed_groups=frozenset(),
     )
     cfg = Config(**(settings | overrides))
-    return TldrBot(cfg, MessageStore(":memory:", 1000), FakeSignal(), FakeLLM())
+    return TldrBot(cfg, MessageStore(":memory:", 1000), FakeSignal(), FakeLLM(), FakeCats())
 
 
 async def test_tldr_end_to_end():
@@ -256,3 +306,27 @@ async def test_only_one_tldr_at_a_time():
     for task in list(bot._tasks):
         await task
     assert bot.signal.sent[-1][1].startswith("TL;DR")
+
+
+async def test_macka():
+    bot = make_bot()
+    bot.handle(envelope(group_data("/macka", ts=10)))
+    for task in list(bot._tasks):
+        await task
+    [(group, _, kwargs)] = bot.signal.sent
+    assert group == GROUP
+    assert kwargs["attachments"] == [("image/jpeg", b"JPEG")]
+    assert kwargs["quote_timestamp"] == 10
+    # Commands aren't part of the chat history.
+    assert bot.store.last_before(GROUP, 10_000, 10) == []
+
+
+async def test_macka_download_failure():
+    bot = make_bot()
+    bot.cats = FakeCats(error=CatError("down"))
+    bot.handle(envelope(group_data("/macka", ts=10)))
+    for task in list(bot._tasks):
+        await task
+    [(_, text, kwargs)] = bot.signal.sent
+    assert "couldn't find a cat" in text
+    assert kwargs["attachments"] is None

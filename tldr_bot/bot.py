@@ -4,6 +4,7 @@ import re
 from dataclasses import dataclass
 from datetime import datetime
 
+from .cats import CatClient, CatError
 from .config import Config
 from .llm import LLMClient, LLMError
 from .signal_api import GroupDelete, GroupEdit, GroupMessage, SignalClient, parse_event, render_mentions
@@ -12,6 +13,7 @@ from .store import ChatMessage, MessageStore
 log = logging.getLogger(__name__)
 
 COMMAND_RE = re.compile(r"^\s*/tldr(?:\s+(\S+))?\s*$", re.IGNORECASE)
+MACKA_RE = re.compile(r"^\s*/macka\s*$", re.IGNORECASE)
 
 
 @dataclass(frozen=True)
@@ -36,6 +38,10 @@ def parse_command(text: str) -> TldrCommand | None:
     return TldrCommand(count=int(arg))
 
 
+def is_macka_command(text: str) -> bool:
+    return MACKA_RE.match(text) is not None
+
+
 def build_transcript(messages: list[ChatMessage], max_chars: int) -> tuple[str, int]:
     """Format messages as transcript lines, keeping the newest ones that fit in max_chars.
 
@@ -55,11 +61,12 @@ def build_transcript(messages: list[ChatMessage], max_chars: int) -> tuple[str, 
 
 
 class TldrBot:
-    def __init__(self, cfg: Config, store: MessageStore, signal: SignalClient, llm: LLMClient):
+    def __init__(self, cfg: Config, store: MessageStore, signal: SignalClient, llm: LLMClient, cats: CatClient):
         self.cfg = cfg
         self.store = store
         self.signal = signal
         self.llm = llm
+        self.cats = cats
         self._tasks: set[asyncio.Task] = set()
         # Only one summary runs at a time, across all groups.
         self._busy = False
@@ -85,6 +92,9 @@ class TldrBot:
             case GroupEdit():
                 text = render_mentions(event.text, event.mentions, self.store.display_name)
                 self.store.edit(event.group_id, event.sender_id, event.target_timestamp, text)
+            case GroupMessage() if is_macka_command(event.text):
+                log.info("/macka from %s in group %s", event.sender_name, event.group_id)
+                self._spawn(self.run_macka(event))
             case GroupMessage():
                 command = parse_command(event.text)
                 if command is None:
@@ -94,18 +104,36 @@ class TldrBot:
                     )
                 else:
                     log.info("/tldr from %s in group %s", event.sender_name, event.group_id)
-                    task = asyncio.create_task(self.run_tldr(event, command))
-                    self._tasks.add(task)
-                    task.add_done_callback(self._tasks.discard)
+                    self._spawn(self.run_tldr(event, command))
 
-    async def reply(self, to: GroupMessage, text: str) -> None:
+    def _spawn(self, coro) -> None:
+        task = asyncio.create_task(coro)
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
+
+    async def reply(
+        self, to: GroupMessage, text: str, attachments: list[tuple[str, bytes]] | None = None
+    ) -> None:
         await self.signal.send_group(
             to.group_id,
             text,
             quote_timestamp=to.timestamp,
             quote_author=to.sender_number or to.sender_id,
             quote_text=to.text,
+            attachments=attachments,
         )
+
+    async def run_macka(self, msg: GroupMessage) -> None:
+        try:
+            try:
+                cat = await self.cats.random_cat()
+            except CatError as e:
+                log.error("Cat download failed: %s", e)
+                await self.reply(msg, "Sorry, I couldn't find a cat right now.")
+                return
+            await self.reply(msg, "🐈", attachments=[cat])
+        except Exception:
+            log.exception("/macka failed")
 
     async def run_tldr(self, msg: GroupMessage, command: TldrCommand) -> None:
         try:

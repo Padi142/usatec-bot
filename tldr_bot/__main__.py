@@ -3,6 +3,7 @@ import logging
 import os
 
 from .bot import TldrBot
+from .cats import CatClient
 from .config import Config
 from .llm import LLMClient
 from .signal_api import SignalClient
@@ -14,11 +15,13 @@ async def main() -> None:
     store = MessageStore(cfg.db_path, cfg.history_limit)
     signal = SignalClient(cfg.signal_api_url, cfg.signal_number)
     llm = LLMClient(cfg.llm_base_url, cfg.llm_model, cfg.llm_api_key, cfg.llm_timeout)
+    cats = CatClient()
     try:
-        await TldrBot(cfg, store, signal, llm).run()
+        await TldrBot(cfg, store, signal, llm, cats).run()
     finally:
         await signal.close()
         await llm.close()
+        await cats.close()
         store.close()
 
 

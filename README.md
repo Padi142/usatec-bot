@@ -10,6 +10,8 @@ it takes the last 100 messages of that group, sends them to an LLM on
 [e-INFRA CZ AI-as-a-Service](https://docs.cerit-sc.cz/en/docs/ai-as-a-service/chat-ai),
 and replies with a summary of the conversation and its topics. `/tldr` with no number uses `TLDR_DEFAULT_COUNT` (50).
 
+`/macka` replies with a random cat picture from [kocicividea.cz](https://kocicividea.cz/).
+
 ## How it works
 
 Signal has no API for fetching chat history, so the bot **saves every group

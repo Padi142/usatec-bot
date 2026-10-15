@@ -179,12 +179,19 @@ class SignalClient:
         quote_timestamp: int | None = None,
         quote_author: str | None = None,
         quote_text: str | None = None,
+        attachments: list[tuple[str, bytes]] | None = None,
     ) -> None:
+        """Send a group message. attachments are (content type, data) pairs."""
         body: dict = {
             "number": self.number,
             "recipients": [to_rest_group_id(group_id)],
             "message": text,
         }
+        if attachments:
+            body["base64_attachments"] = [
+                f"data:{content_type};base64,{base64.b64encode(data).decode()}"
+                for content_type, data in attachments
+            ]
         if quote_timestamp and quote_author:
             body |= {
                 "quote_timestamp": quote_timestamp,
