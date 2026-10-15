@@ -4,21 +4,34 @@ services:
     environment:
       - MODE=json-rpc
     volumes:
-      # :Z relabels the dir for SELinux (Fedora); harmless elsewhere.
-      - ./data/signal-cli:/home/.local/share/signal-cli:Z
-    ports:
-      # Only reachable from this machine, needed for linking/setup via curl.
-      - "127.0.0.1:8080:8080"
+      - signal-cli-data:/home/.local/share/signal-cli
+    # No published ports on purpose: the API has no authentication, so anyone who can
+    # reach it can send messages as the account. See the README for how to reach it.
     restart: unless-stopped
 
   bot:
     build: .
-    env_file: .env
     environment:
       - SIGNAL_API_URL=http://signal-api:8080
       - DB_PATH=/data/messages.db
+      - SIGNAL_NUMBER=${SIGNAL_NUMBER:?}
+      - LLM_API_KEY=${LLM_API_KEY:?}
+      - LLM_BASE_URL=${LLM_BASE_URL:-https://llm.ai.e-infra.cz/v1}
+      - LLM_MODEL=${LLM_MODEL:-deepseek}
+      - LLM_TIMEOUT=${LLM_TIMEOUT:-}
+      - LLM_MAX_INPUT_CHARS=${LLM_MAX_INPUT_CHARS:-}
+      - TLDR_DEFAULT_COUNT=${TLDR_DEFAULT_COUNT:-}
+      - TLDR_MAX_COUNT=${TLDR_MAX_COUNT:-}
+      - HISTORY_LIMIT=${HISTORY_LIMIT:-}
+      - ALLOWED_GROUPS=${ALLOWED_GROUPS:-}
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - TZ=${TZ:-Europe/Prague}
     volumes:
-      - ./data/bot:/data:Z
+      - bot-data:/data
     depends_on:
       - signal-api
     restart: unless-stopped
+
+volumes:
+  signal-cli-data:
+  bot-data:
