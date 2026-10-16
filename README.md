@@ -23,7 +23,8 @@ more, only the newest ones are used.
 
 `/mackagen` generates a new cat with [nano-catana](https://research.kocicividea.cz/), using
 the `cat-diffusion-v2` model. `/mackagen a cat wearing a tiny hat` generates one from the prompt
-with the `flowmatch-cats-tti` text-to-cat model. Generating takes around 20 seconds, and
+with the `flowmatch-cats-tti` text-to-cat model. `/mackagen 2x2` and `/mackagen 3x3` make a grid
+of 4 or 9 cats in one picture (only without a prompt). Generating takes around 20 seconds, and
 it needs `CAT_GEN_API_KEY` to be set.
 
 ## How it works

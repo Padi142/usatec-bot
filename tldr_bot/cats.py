@@ -63,11 +63,14 @@ class CatGenClient:
             raise CatError(f"Unexpected response from {path}: {data!r:.200}")
         return data
 
-    async def generate(self, prompt: str | None = None) -> tuple[str, bytes]:
-        """Generate a cat picture and wait for the job to finish. Returns (content type, image bytes)."""
+    async def generate(self, prompt: str | None = None, layout: str | None = None) -> tuple[str, bytes]:
+        """Generate a cat picture and wait for the job to finish. Returns (content type, image bytes).
+
+        layout ("2x2", "3x3") makes a grid of cats in one image; only the model without a prompt supports it.
+        """
         try:
             async with asyncio.timeout(self.timeout):
-                url = await self._run_job(prompt)
+                url = await self._run_job(prompt, layout)
                 resp = await self._http.get(url)  # No auth header: the image lives on another host.
                 resp.raise_for_status()
         except TimeoutError as e:
@@ -79,12 +82,14 @@ class CatGenClient:
             raise CatError(f"Expected an image, got {content_type or 'no content type'}")
         return content_type, resp.content
 
-    async def _run_job(self, prompt: str | None) -> str:
+    async def _run_job(self, prompt: str | None, layout: str | None) -> str:
         """Create a job and poll it until it's done. Returns the image URL."""
         if prompt:
             body = {"model": CAT_GEN_PROMPT_MODEL, "prompt": prompt[:PROMPT_MAX_LENGTH]}
         else:
             body = {"model": CAT_GEN_MODEL}
+        if layout:
+            body["layout"] = layout
         job = await self._api("POST", "/api/v1/jobs", json=body)
         job_id = job.get("id")
         if not job_id:

@@ -14,6 +14,7 @@ from tldr_bot.bot import (
     format_since,
     is_macka_command,
     parse_command,
+    MackaGenCommand,
     parse_macka_gen,
     resolve_since_time,
 )
@@ -118,10 +119,14 @@ def test_is_macka_command(text, expected):
 @pytest.mark.parametrize(
     "text, expected",
     [
-        ("/mackagen", ""),
-        ("  /MACKAGEN  ", ""),
-        ("/mackagen a cat in a hat", "a cat in a hat"),
-        ("/mackagen  multi\nline ", "multi\nline"),
+        ("/mackagen", MackaGenCommand()),
+        ("  /MACKAGEN  ", MackaGenCommand()),
+        ("/mackagen a cat in a hat", MackaGenCommand(prompt="a cat in a hat")),
+        ("/mackagen  multi\nline ", MackaGenCommand(prompt="multi\nline")),
+        ("/mackagen 2x2", MackaGenCommand(layout="2x2")),
+        ("/mackagen 3X3 ", MackaGenCommand(layout="3x3")),
+        ("/mackagen 2x2 a cat", MackaGenCommand(prompt="a cat", layout="2x2")),
+        ("/mackagen 4x4", MackaGenCommand(prompt="4x4")),
         ("/macka", None),
         ("/mackagenx", None),
         ("hey /mackagen", None),
@@ -328,6 +333,15 @@ async def test_cat_gen_without_prompt():
     assert json.loads(requests[0].content) == {"model": "cat-diffusion-v2"}
 
 
+async def test_cat_gen_grid():
+    requests = []
+    cat_gen = cat_gen_api(
+        [{"id": "j1", "state": "done", "images": [{"url": "http://images/j1/0.png"}], "error": None}], requests
+    )
+    await cat_gen.generate(layout="3x3")
+    assert json.loads(requests[0].content) == {"model": "cat-diffusion-v2", "layout": "3x3"}
+
+
 async def test_cat_gen_job_failed():
     cat_gen = cat_gen_api([{"id": "j1", "state": "failed", "images": [], "error": "GPU on fire"}], [])
     with pytest.raises(CatError, match="GPU on fire"):
@@ -394,10 +408,10 @@ class FakeCats:
 
 class FakeCatGen:
     def __init__(self):
-        self.prompts = []
+        self.calls = []
 
-    async def generate(self, prompt=None):
-        self.prompts.append(prompt)
+    async def generate(self, prompt=None, layout=None):
+        self.calls.append((prompt, layout))
         return "image/png", b"PNG"
 
 
@@ -671,11 +685,22 @@ async def test_macka_gen():
     bot = make_bot()
     bot.handle(envelope(group_data("/mackagen a cat in a hat", ts=10)))
     bot.handle(envelope(group_data("/mackagen", ts=11)))
+    bot.handle(envelope(group_data("/mackagen 2x2", ts=12)))
     for task in list(bot._tasks):
         await task
-    assert bot.cat_gen.prompts == ["a cat in a hat", None]
-    assert [kwargs["attachments"] for _, _, kwargs in bot.signal.sent] == [[("image/png", b"PNG")]] * 2
+    assert bot.cat_gen.calls == [("a cat in a hat", None), (None, None), (None, "2x2")]
+    assert [kwargs["attachments"] for _, _, kwargs in bot.signal.sent] == [[("image/png", b"PNG")]] * 3
     assert bot.store.last_before(GROUP, 10_000, 10) == []
+
+
+async def test_macka_gen_grid_with_prompt():
+    bot = make_bot()
+    bot.handle(envelope(group_data("/mackagen 3x3 a cat in a hat", ts=10)))
+    for task in list(bot._tasks):
+        await task
+    assert bot.cat_gen.calls == []
+    [(_, text, _)] = bot.signal.sent
+    assert "only work without a prompt" in text
 
 
 async def test_macka_gen_not_configured():

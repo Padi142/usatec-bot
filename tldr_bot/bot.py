@@ -16,6 +16,7 @@ log = logging.getLogger(__name__)
 
 MACKA_RE = re.compile(r"^\s*/macka\s*$", re.IGNORECASE)
 MACKA_GEN_RE = re.compile(r"^\s*/mackagen(?:\s+(.*?))?\s*$", re.IGNORECASE | re.DOTALL)
+GRID_LAYOUTS = ("2x2", "3x3")
 
 # CET/CEST. The tzdata package is a dependency because slim Docker images
 # often ship without the system zoneinfo database.
@@ -114,12 +115,22 @@ def is_macka_command(text: str) -> bool:
     return MACKA_RE.match(text) is not None
 
 
-def parse_macka_gen(text: str) -> str | None:
-    """Parse "/mackagen [prompt]". Returns the prompt ("" if none), or None if it isn't the command."""
+@dataclass(frozen=True)
+class MackaGenCommand:
+    prompt: str | None = None
+    layout: str | None = None  # a grid like "2x2"; None means a single image
+
+
+def parse_macka_gen(text: str) -> MackaGenCommand | None:
+    """Parse "/mackagen [2x2|3x3] [prompt]". Returns None if the text isn't a /mackagen command."""
     m = MACKA_GEN_RE.match(text)
     if not m:
         return None
-    return m.group(1) or ""
+    arg = m.group(1) or ""
+    first, *rest = arg.split(maxsplit=1) or [""]
+    if first.lower() in GRID_LAYOUTS:
+        return MackaGenCommand(prompt=rest[0] if rest else None, layout=first.lower())
+    return MackaGenCommand(prompt=arg or None)
 
 
 def build_transcript(messages: list[ChatMessage], max_chars: int) -> tuple[str, int]:
@@ -184,9 +195,9 @@ class TldrBot:
             case GroupMessage() if is_macka_command(event.text):
                 log.info("/macka from %s in group %s", event.sender_name, event.group_id)
                 self._spawn(self.run_macka(event))
-            case GroupMessage() if (prompt := parse_macka_gen(event.text)) is not None:
+            case GroupMessage() if (gen := parse_macka_gen(event.text)) is not None:
                 log.info("/mackagen from %s in group %s", event.sender_name, event.group_id)
-                self._spawn(self.run_macka_gen(event, prompt))
+                self._spawn(self.run_macka_gen(event, gen))
             case GroupMessage():
                 command = parse_command(event.text)
                 if command is None:
@@ -227,14 +238,21 @@ class TldrBot:
         except Exception:
             log.exception("/macka failed")
 
-    async def run_macka_gen(self, msg: GroupMessage, prompt: str) -> None:
+    async def run_macka_gen(self, msg: GroupMessage, command: MackaGenCommand) -> None:
         try:
             if self.cat_gen is None:
                 await self.reply(msg, "Cat generation isn't set up (CAT_GEN_API_KEY is missing).")
                 return
+            if command.layout and command.prompt:
+                await self.reply(
+                    msg,
+                    f"Grids only work without a prompt: /mackagen {command.layout}\n"
+                    "With a prompt I can only make a single cat.",
+                )
+                return
             await self.signal.set_typing(msg.group_id, True)
             try:
-                cat = await self.cat_gen.generate(prompt or None)
+                cat = await self.cat_gen.generate(command.prompt, command.layout)
             except CatError as e:
                 log.error("Cat generation failed: %s", e)
                 await self.reply(msg, "Sorry, I couldn't generate a cat right now.")
