@@ -1,10 +1,20 @@
 import asyncio
 import json
+from datetime import datetime, timedelta
 
 import httpx
 import pytest
 
-from tldr_bot.bot import TldrBot, TldrCommand, build_transcript, is_macka_command, parse_command
+from tldr_bot.bot import (
+    LOCAL_TZ,
+    TldrBot,
+    TldrCommand,
+    build_transcript,
+    format_since,
+    is_macka_command,
+    parse_command,
+    resolve_since_time,
+)
 from tldr_bot.cats import CatClient, CatError
 from tldr_bot.config import Config, normalize_group_id
 from tldr_bot.llm import LLMClient, LLMError
@@ -46,9 +56,22 @@ def group_data(message="hi", ts=1000, **extra):
         ("/tldr", TldrCommand()),
         ("/tldr 50", TldrCommand(count=50)),
         ("  /TLDR   7 ", TldrCommand(count=7)),
+        ("/tldr since 14:01", TldrCommand(since=(14, 1))),
+        ("/tldr SINCE 9:05", TldrCommand(since=(9, 5))),
+        ("/tldr  since  23:59  ", TldrCommand(since=(23, 59))),
+        ("/tldr afk", TldrCommand(afk=True)),
+        ("  /TLDR   AFK  ", TldrCommand(afk=True)),
         ("/tldr 0", TldrCommand(error="usage")),
         ("/tldr abc", TldrCommand(error="usage")),
         ("/tldr 5 more", TldrCommand(error="usage")),
+        ("/tldr since", TldrCommand(error="usage")),
+        ("/tldr since 25:00", TldrCommand(error="usage")),
+        ("/tldr since 12:60", TldrCommand(error="usage")),
+        ("/tldr since 1401", TldrCommand(error="usage")),
+        ("/tldr since 14:01 pm", TldrCommand(error="usage")),
+        ("/tldr since 14:01 15:02", TldrCommand(error="usage")),
+        ("/tldr afk now", TldrCommand(error="usage")),
+        ("/tldr 14:01", TldrCommand(error="usage")),
         ("hello", None),
         ("/tldrx", None),
         ("what does /tldr do?", None),
@@ -56,6 +79,29 @@ def group_data(message="hi", ts=1000, **extra):
 )
 def test_parse_command(text, expected):
     assert parse_command(text) == expected
+
+
+def test_resolve_since_time_same_day():
+    now = datetime(2026, 6, 5, 16, 23, 45, tzinfo=LOCAL_TZ)
+    assert resolve_since_time((14, 1), now) == datetime(2026, 6, 5, 14, 1, tzinfo=LOCAL_TZ)
+
+
+def test_resolve_since_time_previous_day():
+    # The requested time is still in the future today, so it means yesterday.
+    now = datetime(2026, 6, 5, 0, 24, tzinfo=LOCAL_TZ)
+    assert resolve_since_time((23, 15), now) == datetime(2026, 6, 4, 23, 15, tzinfo=LOCAL_TZ)
+
+
+def test_resolve_since_time_boundary():
+    # hh:mm equal to the current wall clock is today (now still has seconds left).
+    now = datetime(2026, 6, 5, 16, 23, 45, tzinfo=LOCAL_TZ)
+    assert resolve_since_time((16, 23), now) == datetime(2026, 6, 5, 16, 23, tzinfo=LOCAL_TZ)
+
+
+def test_format_since():
+    now = datetime(2026, 6, 5, 16, 23, tzinfo=LOCAL_TZ)
+    assert format_since(datetime(2026, 6, 5, 14, 1, tzinfo=LOCAL_TZ), now) == "14:01"
+    assert format_since(datetime(2026, 6, 4, 23, 15, tzinfo=LOCAL_TZ), now) == "2026-06-04 23:15"
 
 
 @pytest.mark.parametrize(
@@ -116,6 +162,10 @@ def msg(ts, text="m", group=GROUP, sender="a"):
     return ChatMessage(group, sender, sender.upper(), ts, text)
 
 
+def epoch_ms(dt: datetime) -> int:
+    return round(dt.timestamp() * 1000)
+
+
 def test_store_last_before_and_dedup():
     store = MessageStore(":memory:", history_limit=100)
     for ts in range(1, 11):
@@ -124,6 +174,31 @@ def test_store_last_before_and_dedup():
     store.add(msg(3, group="other"))
     got = store.last_before(GROUP, before_timestamp=9, limit=3)
     assert [m.text for m in got] == ["m6", "m7", "m8"]
+
+
+def test_store_last_before_after_window():
+    store = MessageStore(":memory:", history_limit=100)
+    for ts in range(1, 11):
+        store.add(msg(ts, f"m{ts}"))
+    # Newest 3 of the messages in (4, 9).
+    got = store.last_before(GROUP, before_timestamp=9, limit=3, after_timestamp=4)
+    assert [m.text for m in got] == ["m6", "m7", "m8"]
+    # No lower bound behaves as before.
+    got = store.last_before(GROUP, 9, 100)
+    assert [m.text for m in got] == [f"m{i}" for i in range(1, 9)]
+    # An empty window yields no messages.
+    assert store.last_before(GROUP, 100, 100, after_timestamp=100) == []
+
+
+def test_store_last_from():
+    store = MessageStore(":memory:", history_limit=100)
+    store.add(msg(1, "a1", sender="alice"))
+    store.add(msg(2, "b1", sender="bob"))
+    store.add(msg(3, "a2", sender="alice"))
+    assert store.last_from(GROUP, "alice", 10).text == "a2"
+    assert store.last_from(GROUP, "alice", 3).text == "a1"  # strictly before
+    assert store.last_from(GROUP, "alice", 1) is None
+    assert store.last_from(GROUP, "carol", 10) is None
 
 
 def test_store_edit_delete_prune():
@@ -144,6 +219,12 @@ def test_build_transcript_trims_oldest():
     # Always include at least one message, even if it's over budget.
     _, n = build_transcript(messages, max_chars=1)
     assert n == 1
+
+
+def test_build_transcript_uses_prague_time():
+    ts = epoch_ms(datetime(2026, 6, 5, 14, 1, tzinfo=LOCAL_TZ))
+    transcript, _ = build_transcript([msg(ts, "hello")], max_chars=1000)
+    assert transcript.startswith("[2026-06-05 14:01] ")
 
 
 # --- LLM client --------------------------------------------------------------
@@ -268,6 +349,161 @@ async def test_tldr_empty_history():
         await task
     [(_, text, _)] = bot.signal.sent
     assert "don't have any messages" in text
+
+
+# --- /tldr since -------------------------------------------------------------
+
+NOW = datetime(2026, 6, 5, 16, 23, tzinfo=LOCAL_TZ)
+
+
+def freeze_now(monkeypatch):
+    monkeypatch.setattr("tldr_bot.bot._now", lambda: NOW)
+
+
+async def test_tldr_since_same_day(monkeypatch):
+    freeze_now(monkeypatch)
+    bot = make_bot()
+    for i, (h, m) in enumerate([(13, 0), (14, 0), (14, 1), (14, 2), (15, 30)]):
+        ts = epoch_ms(datetime(2026, 6, 5, h, m, tzinfo=LOCAL_TZ))
+        bot.handle(envelope(group_data(f"message {i}", ts=ts), name=f"P{i}", uuid=f"u{i}"))
+    bot.handle(envelope(group_data("/tldr since 14:01", ts=epoch_ms(NOW)), name="P9", uuid="u9"))
+    for task in list(bot._tasks):
+        await task
+
+    transcript = bot.llm.transcripts[0]
+    assert "message 0" not in transcript  # 13:00, before the cutoff
+    assert "message 1" not in transcript  # 14:00, before the cutoff
+    assert "message 2" not in transcript  # 14:01 exactly; the boundary is exclusive
+    assert "message 3" in transcript
+    assert "message 4" in transcript
+    [(group, text, _)] = bot.signal.sent
+    assert group == GROUP
+    assert text.startswith("TL;DR of 2 messages since 14:01:")
+
+
+async def test_tldr_since_yesterday(monkeypatch):
+    # The requested time is later today, so it means yesterday at that time.
+    freeze_now(monkeypatch)
+    bot = make_bot()
+    for text_, dt in [
+        ("before", datetime(2026, 6, 4, 22, 0, tzinfo=LOCAL_TZ)),
+        ("after", datetime(2026, 6, 4, 23, 16, tzinfo=LOCAL_TZ)),
+        ("today", datetime(2026, 6, 5, 0, 0, tzinfo=LOCAL_TZ)),
+    ]:
+        bot.handle(envelope(group_data(text_, ts=epoch_ms(dt)), name=f"P-{text_}", uuid=f"u-{text_}"))
+    bot.handle(envelope(group_data("/tldr since 23:15", ts=epoch_ms(NOW)), name="P9", uuid="u9"))
+    for task in list(bot._tasks):
+        await task
+
+    transcript = bot.llm.transcripts[0]
+    assert "before" not in transcript
+    assert "after" in transcript
+    assert "today" in transcript
+    [(_, text, _)] = bot.signal.sent
+    assert text.startswith("TL;DR of 2 messages since 2026-06-04 23:15:")
+
+
+async def test_tldr_since_capped_at_max_count(monkeypatch):
+    freeze_now(monkeypatch)
+    bot = make_bot(max_count=3)
+    base = datetime(2026, 6, 5, 10, 0, tzinfo=LOCAL_TZ)
+    for i in range(5):
+        bot.handle(
+            envelope(group_data(f"m{i}", ts=epoch_ms(base + timedelta(minutes=i))), name=f"P{i}", uuid=f"u{i}")
+        )
+    bot.handle(envelope(group_data("/tldr since 9:00", ts=epoch_ms(NOW)), name="P9", uuid="u9"))
+    for task in list(bot._tasks):
+        await task
+
+    transcript = bot.llm.transcripts[0]
+    assert "m0" not in transcript and "m1" not in transcript  # oldest ones dropped
+    assert all(f"m{i}" in transcript for i in (2, 3, 4))
+    [(_, text, _)] = bot.signal.sent
+    assert text.startswith("TL;DR of 3 messages since 09:00 (capped at 3):")
+
+
+async def test_tldr_since_empty_window(monkeypatch):
+    freeze_now(monkeypatch)
+    bot = make_bot()
+    bot.handle(
+        envelope(group_data("old", ts=epoch_ms(datetime(2026, 6, 5, 15, 0, tzinfo=LOCAL_TZ))), name="P0", uuid="u0")
+    )
+    bot.handle(envelope(group_data("/tldr since 16:00", ts=epoch_ms(NOW)), name="P1", uuid="u1"))
+    for task in list(bot._tasks):
+        await task
+    [(_, text, _)] = bot.signal.sent
+    assert text == "I don't have any messages since 16:00."
+
+
+# --- /tldr afk ---------------------------------------------------------------
+
+async def test_tldr_afk():
+    bot = make_bot()
+    for ts, name, uuid, text_ in [
+        (1, "Alice", "u-alice", "question from alice"),
+        (2, "Alice", "u-alice", "brb"),
+        (3, "Bob", "u-bob", "answer 1"),
+        (4, "Bob", "u-bob", "answer 2"),
+    ]:
+        bot.handle(envelope(group_data(text_, ts=ts), name=name, uuid=uuid))
+    bot.handle(envelope(group_data("/tldr afk", ts=10), name="Alice", uuid="u-alice"))
+    for task in list(bot._tasks):
+        await task
+
+    transcript = bot.llm.transcripts[0]
+    assert "question from alice" not in transcript
+    assert "brb" not in transcript  # her own last message is the anchor, not part of the summary
+    assert "answer 1" in transcript
+    assert "answer 2" in transcript
+    [(_, text, _)] = bot.signal.sent
+    assert text.startswith("TL;DR of 2 messages since your last message:")
+
+
+async def test_tldr_afk_capped_at_max_count():
+    bot = make_bot(max_count=3)
+    bot.handle(envelope(group_data("mine", ts=1), name="Alice", uuid="u-alice"))
+    for i in range(5):
+        bot.handle(envelope(group_data(f"m{i}", ts=2 + i), name=f"P{i}", uuid=f"u{i}"))
+    bot.handle(envelope(group_data("/tldr afk", ts=20), name="Alice", uuid="u-alice"))
+    for task in list(bot._tasks):
+        await task
+
+    transcript = bot.llm.transcripts[0]
+    assert "mine" not in transcript
+    assert "m0" not in transcript and "m1" not in transcript
+    assert all(f"m{i}" in transcript for i in (2, 3, 4))
+    [(_, text, _)] = bot.signal.sent
+    assert text.startswith("TL;DR of 3 messages since your last message (capped at 3):")
+
+
+async def test_tldr_afk_nothing_new():
+    bot = make_bot()
+    bot.handle(envelope(group_data("brb", ts=1), name="Alice", uuid="u-alice"))
+    bot.handle(envelope(group_data("/tldr afk", ts=10), name="Alice", uuid="u-alice"))
+    for task in list(bot._tasks):
+        await task
+    [(_, text, _)] = bot.signal.sent
+    assert text == "Nothing new since your last message."
+
+
+async def test_tldr_afk_no_previous_message():
+    bot = make_bot()
+    bot.handle(envelope(group_data("hi", ts=1), name="Bob", uuid="u-bob"))
+    bot.handle(envelope(group_data("/tldr afk", ts=10), name="Alice", uuid="u-alice"))
+    for task in list(bot._tasks):
+        await task
+    [(_, text, _)] = bot.signal.sent
+    assert "I don't have any of your messages" in text
+
+
+async def test_usage_mentions_new_forms():
+    bot = make_bot()
+    bot.handle(envelope(group_data("/tldr xyz", ts=1)))
+    for task in list(bot._tasks):
+        await task
+    [(_, text, _)] = bot.signal.sent
+    assert "/tldr since HH:MM" in text
+    assert "/tldr afk" in text
 
 
 async def test_allowed_groups_filter():
