@@ -24,6 +24,7 @@ services:
       - TLDR_MAX_COUNT=${TLDR_MAX_COUNT:-}
       - HISTORY_LIMIT=${HISTORY_LIMIT:-}
       - ALLOWED_GROUPS=${ALLOWED_GROUPS:-}
+      - CAT_GEN_API_KEY=${CAT_GEN_API_KEY:-}
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
       - TZ=${TZ:-Europe/Prague}
     volumes:

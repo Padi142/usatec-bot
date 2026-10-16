@@ -21,6 +21,11 @@ more, only the newest ones are used.
 
 `/macka` replies with a random cat picture from [kocicividea.cz](https://kocicividea.cz/).
 
+`/macka-gen` generates a new cat with [nano-catana](https://research.kocicividea.cz/), using
+the `cat-diffusion-v2` model. `/macka-gen a cat wearing a tiny hat` generates one from the prompt
+with the `flowmatch-cats-tti` text-to-cat model. Generating takes around 20 seconds, and
+it needs `CAT_GEN_API_KEY` to be set.
+
 ## How it works
 
 Signal has no API for fetching chat history, so the bot **saves every group

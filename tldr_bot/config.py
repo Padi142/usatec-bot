@@ -52,6 +52,8 @@ class Config:
     history_limit: int
     allowed_groups: frozenset[str]
 
+    cat_gen_api_key: str | None = None
+
     @classmethod
     def from_env(cls) -> "Config":
         allowed = os.environ.get("ALLOWED_GROUPS", "")
@@ -70,4 +72,5 @@ class Config:
             allowed_groups=frozenset(
                 normalize_group_id(g) for g in allowed.split(",") if g.strip()
             ),
+            cat_gen_api_key=os.environ.get("CAT_GEN_API_KEY") or None,
         )

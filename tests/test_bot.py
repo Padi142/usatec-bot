@@ -13,9 +13,10 @@ from tldr_bot.bot import (
     format_since,
     is_macka_command,
     parse_command,
+    parse_macka_gen,
     resolve_since_time,
 )
-from tldr_bot.cats import CatClient, CatError
+from tldr_bot.cats import CatClient, CatError, CatGenClient
 from tldr_bot.config import Config, normalize_group_id
 from tldr_bot.llm import LLMClient, LLMError
 from tldr_bot.signal_api import (
@@ -110,6 +111,22 @@ def test_format_since():
 )
 def test_is_macka_command(text, expected):
     assert is_macka_command(text) is expected
+
+
+@pytest.mark.parametrize(
+    "text, expected",
+    [
+        ("/macka-gen", ""),
+        ("  /MACKA-GEN  ", ""),
+        ("/macka-gen a cat in a hat", "a cat in a hat"),
+        ("/macka-gen  multi\nline ", "multi\nline"),
+        ("/macka", None),
+        ("/macka-genx", None),
+        ("hey /macka-gen", None),
+    ],
+)
+def test_parse_macka_gen(text, expected):
+    assert parse_macka_gen(text) == expected
 
 
 # --- envelope parsing --------------------------------------------------------
@@ -266,6 +283,55 @@ async def test_random_cat_rejects_non_image():
         await cats.random_cat()
 
 
+def cat_gen_api(jobs: list[dict], requests: list[httpx.Request]):
+    """A fake nano-catana API that serves the given job states in order."""
+    states = iter(jobs)
+
+    def handler(request: httpx.Request):
+        requests.append(request)
+        if request.url.host == "images":
+            return httpx.Response(200, content=b"PNG", headers={"content-type": "image/png"})
+        return httpx.Response(202 if request.method == "POST" else 200, json=next(states))
+
+    cat_gen = CatGenClient("secret", base_url="http://catgen", poll_interval=0)
+    cat_gen._http._transport = httpx.MockTransport(handler)
+    return cat_gen
+
+
+async def test_cat_gen_with_prompt():
+    requests = []
+    cat_gen = cat_gen_api(
+        [
+            {"id": "j1", "state": "queued", "images": [], "error": None},
+            {"id": "j1", "state": "running", "images": [], "error": None},
+            {"id": "j1", "state": "done", "images": [{"url": "http://images/j1/0.png"}], "error": None},
+        ],
+        requests,
+    )
+    assert await cat_gen.generate("a cat in a hat") == ("image/png", b"PNG")
+    create, poll1, poll2, image = requests
+    assert json.loads(create.content) == {"model": "flowmatch-cats-tti", "prompt": "a cat in a hat"}
+    assert create.headers["authorization"] == "Bearer secret"
+    assert poll2.url.path == "/api/v1/jobs/j1"
+    # The image lives on another host, so the API key isn't sent there.
+    assert "authorization" not in image.headers
+
+
+async def test_cat_gen_without_prompt():
+    requests = []
+    cat_gen = cat_gen_api(
+        [{"id": "j1", "state": "done", "images": [{"url": "http://images/j1/0.png"}], "error": None}], requests
+    )
+    await cat_gen.generate()
+    assert json.loads(requests[0].content) == {"model": "cat-diffusion-v2"}
+
+
+async def test_cat_gen_job_failed():
+    cat_gen = cat_gen_api([{"id": "j1", "state": "failed", "images": [], "error": "GPU on fire"}], [])
+    with pytest.raises(CatError, match="GPU on fire"):
+        await cat_gen.generate()
+
+
 async def test_send_group_with_attachment():
     bodies = []
 
@@ -302,6 +368,15 @@ class FakeCats:
         return "image/jpeg", b"JPEG"
 
 
+class FakeCatGen:
+    def __init__(self):
+        self.prompts = []
+
+    async def generate(self, prompt=None):
+        self.prompts.append(prompt)
+        return "image/png", b"PNG"
+
+
 class FakeLLM:
     def __init__(self):
         self.transcripts = []
@@ -319,7 +394,7 @@ def make_bot(**overrides):
         allowed_groups=frozenset(),
     )
     cfg = Config(**(settings | overrides))
-    return TldrBot(cfg, MessageStore(":memory:", 1000), FakeSignal(), FakeLLM(), FakeCats())
+    return TldrBot(cfg, MessageStore(":memory:", 1000), FakeSignal(), FakeLLM(), FakeCats(), FakeCatGen())
 
 
 async def test_tldr_end_to_end():
@@ -566,3 +641,24 @@ async def test_macka_download_failure():
     [(_, text, kwargs)] = bot.signal.sent
     assert "couldn't find a cat" in text
     assert kwargs["attachments"] is None
+
+
+async def test_macka_gen():
+    bot = make_bot()
+    bot.handle(envelope(group_data("/macka-gen a cat in a hat", ts=10)))
+    bot.handle(envelope(group_data("/macka-gen", ts=11)))
+    for task in list(bot._tasks):
+        await task
+    assert bot.cat_gen.prompts == ["a cat in a hat", None]
+    assert [kwargs["attachments"] for _, _, kwargs in bot.signal.sent] == [[("image/png", b"PNG")]] * 2
+    assert bot.store.last_before(GROUP, 10_000, 10) == []
+
+
+async def test_macka_gen_not_configured():
+    bot = make_bot()
+    bot.cat_gen = None
+    bot.handle(envelope(group_data("/macka-gen", ts=10)))
+    for task in list(bot._tasks):
+        await task
+    [(_, text, _)] = bot.signal.sent
+    assert "CAT_GEN_API_KEY" in text

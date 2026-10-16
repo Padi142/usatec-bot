@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
-from .cats import CatClient, CatError
+from .cats import CatClient, CatError, CatGenClient
 from .config import Config
 from .llm import LLMClient, LLMError
 from .signal_api import GroupDelete, GroupEdit, GroupMessage, SignalClient, parse_event, render_mentions
@@ -15,6 +15,7 @@ from .store import ChatMessage, MessageStore
 log = logging.getLogger(__name__)
 
 MACKA_RE = re.compile(r"^\s*/macka\s*$", re.IGNORECASE)
+MACKA_GEN_RE = re.compile(r"^\s*/macka-gen(?:\s+(.*?))?\s*$", re.IGNORECASE | re.DOTALL)
 
 # CET/CEST. The tzdata package is a dependency because slim Docker images
 # often ship without the system zoneinfo database.
@@ -113,6 +114,14 @@ def is_macka_command(text: str) -> bool:
     return MACKA_RE.match(text) is not None
 
 
+def parse_macka_gen(text: str) -> str | None:
+    """Parse "/macka-gen [prompt]". Returns the prompt ("" if none), or None if it isn't the command."""
+    m = MACKA_GEN_RE.match(text)
+    if not m:
+        return None
+    return m.group(1) or ""
+
+
 def build_transcript(messages: list[ChatMessage], max_chars: int) -> tuple[str, int]:
     """Format messages as transcript lines, keeping the newest ones that fit in max_chars.
 
@@ -132,12 +141,21 @@ def build_transcript(messages: list[ChatMessage], max_chars: int) -> tuple[str, 
 
 
 class TldrBot:
-    def __init__(self, cfg: Config, store: MessageStore, signal: SignalClient, llm: LLMClient, cats: CatClient):
+    def __init__(
+        self,
+        cfg: Config,
+        store: MessageStore,
+        signal: SignalClient,
+        llm: LLMClient,
+        cats: CatClient,
+        cat_gen: CatGenClient | None = None,
+    ):
         self.cfg = cfg
         self.store = store
         self.signal = signal
         self.llm = llm
         self.cats = cats
+        self.cat_gen = cat_gen
         self._tasks: set[asyncio.Task] = set()
         # Only one summary runs at a time, across all groups.
         self._busy = False
@@ -166,6 +184,9 @@ class TldrBot:
             case GroupMessage() if is_macka_command(event.text):
                 log.info("/macka from %s in group %s", event.sender_name, event.group_id)
                 self._spawn(self.run_macka(event))
+            case GroupMessage() if (prompt := parse_macka_gen(event.text)) is not None:
+                log.info("/macka-gen from %s in group %s", event.sender_name, event.group_id)
+                self._spawn(self.run_macka_gen(event, prompt))
             case GroupMessage():
                 command = parse_command(event.text)
                 if command is None:
@@ -205,6 +226,24 @@ class TldrBot:
             await self.reply(msg, "🐈", attachments=[cat])
         except Exception:
             log.exception("/macka failed")
+
+    async def run_macka_gen(self, msg: GroupMessage, prompt: str) -> None:
+        try:
+            if self.cat_gen is None:
+                await self.reply(msg, "Cat generation isn't set up (CAT_GEN_API_KEY is missing).")
+                return
+            await self.signal.set_typing(msg.group_id, True)
+            try:
+                cat = await self.cat_gen.generate(prompt or None)
+            except CatError as e:
+                log.error("Cat generation failed: %s", e)
+                await self.reply(msg, "Sorry, I couldn't generate a cat right now.")
+                return
+            finally:
+                await self.signal.set_typing(msg.group_id, False)
+            await self.reply(msg, "🐈", attachments=[cat])
+        except Exception:
+            log.exception("/macka-gen failed")
 
     async def run_tldr(self, msg: GroupMessage, command: TldrCommand) -> None:
         try:
