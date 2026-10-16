@@ -161,6 +161,10 @@ and run `docker compose up -d` again.
    step 3a or 3b above with `localhost:8080`.
 5. Once the account is linked, use **Restart** in Coolify so the Signal API picks up the account.
 
+Both services have healthchecks in `docker-compose.yml`, which Coolify shows as the app's status.
+The Signal API is healthy when its `/v1/health` endpoint answers. The bot is healthy while it's
+connected to the Signal API, so it shows as unhealthy until the account is linked.
+
 ## Running without Docker
 
 You still need `signal-cli-rest-api` running somewhere (step 1). Then:

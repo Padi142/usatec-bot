@@ -5,6 +5,12 @@ services:
       - MODE=json-rpc
     volumes:
       - signal-cli-data:/home/.local/share/signal-cli
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "-o", "/dev/null", "http://localhost:8080/v1/health"]
+      interval: 30s
+      timeout: 10s
+      start_period: 60s
+      retries: 3
     # No published ports on purpose: the API has no authentication, so anyone who can
     # reach it can send messages as the account. See the README for how to reach it.
     restart: unless-stopped
@@ -29,6 +35,13 @@ services:
       - TZ=${TZ:-Europe/Prague}
     volumes:
       - bot-data:/data
+    # Healthy while the bot is connected to the Signal API; see tldr_bot/health.py.
+    healthcheck:
+      test: ["CMD", "/app/.venv/bin/python", "-m", "tldr_bot.health"]
+      interval: 30s
+      timeout: 10s
+      start_period: 60s
+      retries: 3
     depends_on:
       - signal-api
     restart: unless-stopped

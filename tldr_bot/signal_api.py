@@ -147,6 +147,8 @@ class SignalClient:
     def __init__(self, base_url: str, number: str):
         self.base_url = base_url
         self.number = number
+        # True while the websocket for incoming messages is open.
+        self.connected = False
         self._http = httpx.AsyncClient(base_url=base_url, timeout=30)
 
     async def close(self) -> None:
@@ -161,6 +163,7 @@ class SignalClient:
             try:
                 async with websockets.connect(ws_url, ping_interval=30, max_size=None) as ws:
                     log.info("Connected to %s", ws_url)
+                    self.connected = True
                     backoff = 1
                     async for raw in ws:
                         try:
@@ -169,6 +172,8 @@ class SignalClient:
                             log.warning("Ignoring non-JSON frame: %.200s", raw)
             except (OSError, websockets.WebSocketException) as e:
                 log.warning("Websocket disconnected (%s); reconnecting in %ss", e, backoff)
+            finally:
+                self.connected = False
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, 60)
 

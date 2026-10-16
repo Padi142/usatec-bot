@@ -5,6 +5,7 @@ import os
 from .bot import TldrBot
 from .cats import CatClient, CatGenClient
 from .config import Config
+from .health import heartbeat
 from .llm import LLMClient
 from .signal_api import SignalClient
 from .store import MessageStore
@@ -17,9 +18,11 @@ async def main() -> None:
     llm = LLMClient(cfg.llm_base_url, cfg.llm_model, cfg.llm_api_key, cfg.llm_timeout)
     cats = CatClient()
     cat_gen = CatGenClient(cfg.cat_gen_api_key) if cfg.cat_gen_api_key else None
+    health = asyncio.create_task(heartbeat(signal))
     try:
         await TldrBot(cfg, store, signal, llm, cats, cat_gen).run()
     finally:
+        health.cancel()
         await signal.close()
         await llm.close()
         await cats.close()

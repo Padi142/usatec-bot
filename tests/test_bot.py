@@ -1,5 +1,6 @@
 import asyncio
 import json
+import os
 from datetime import datetime, timedelta
 
 import httpx
@@ -18,6 +19,7 @@ from tldr_bot.bot import (
 )
 from tldr_bot.cats import CatClient, CatError, CatGenClient
 from tldr_bot.config import Config, normalize_group_id
+from tldr_bot.health import heartbeat, is_healthy
 from tldr_bot.llm import LLMClient, LLMError
 from tldr_bot.signal_api import (
     GroupDelete,
@@ -684,3 +686,28 @@ async def test_macka_gen_not_configured():
         await task
     [(_, text, _)] = bot.signal.sent
     assert "CAT_GEN_API_KEY" in text
+
+
+# --- healthcheck -------------------------------------------------------------
+
+async def test_heartbeat(tmp_path):
+    path = tmp_path / "healthy"
+    signal = SignalClient("http://signal", "+420999")
+    task = asyncio.create_task(heartbeat(signal, path, interval=0.01))
+    await asyncio.sleep(0.05)
+    assert not is_healthy(path)
+    signal.connected = True
+    await asyncio.sleep(0.05)
+    assert is_healthy(path)
+    signal.connected = False
+    await asyncio.sleep(0.05)
+    assert not is_healthy(path)
+    task.cancel()
+
+
+def test_stale_heartbeat(tmp_path):
+    path = tmp_path / "healthy"
+    path.touch()
+    assert is_healthy(path)
+    os.utime(path, (0, 0))
+    assert not is_healthy(path)
