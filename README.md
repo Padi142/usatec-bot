@@ -10,6 +10,15 @@ it takes the last 100 messages of that group, sends them to an LLM on
 [e-INFRA CZ AI-as-a-Service](https://docs.cerit-sc.cz/en/docs/ai-as-a-service/chat-ai),
 and replies with a summary of the conversation and its topics. `/tldr` with no number uses `TLDR_DEFAULT_COUNT` (50).
 
+It also understands:
+
+- `/tldr since HH:MM` — summarize everything since that time (in CET/CEST);
+  if the time is later today, it summarizes since that time yesterday,
+- `/tldr afk` — summarize everything since your last message.
+
+All forms summarize at most `TLDR_MAX_COUNT` (500) messages — when there are
+more, only the newest ones are used.
+
 `/macka` replies with a random cat picture from [kocicividea.cz](https://kocicividea.cz/).
 
 ## How it works

@@ -62,15 +62,35 @@ class MessageStore:
                 (group_id, sender_id, target_timestamp),
             )
 
-    def last_before(self, group_id: str, before_timestamp: int, limit: int) -> list[ChatMessage]:
-        """The `limit` most recent messages sent before `before_timestamp`, oldest first."""
-        rows = self._db.execute(
+    def last_before(
+        self, group_id: str, before_timestamp: int, limit: int, after_timestamp: int | None = None
+    ) -> list[ChatMessage]:
+        """The `limit` most recent messages sent in (after_timestamp, before_timestamp), oldest first.
+
+        `after_timestamp` is exclusive; None means "since the beginning".
+        """
+        sql = (
             "SELECT group_id, sender_id, sender_name, timestamp, text FROM messages"
             " WHERE group_id = ? AND timestamp < ?"
-            " ORDER BY timestamp DESC LIMIT ?",
-            (group_id, before_timestamp, limit),
-        ).fetchall()
+        )
+        params: list[object] = [group_id, before_timestamp]
+        if after_timestamp is not None:
+            sql += " AND timestamp > ?"
+            params.append(after_timestamp)
+        sql += " ORDER BY timestamp DESC LIMIT ?"
+        params.append(limit)
+        rows = self._db.execute(sql, params).fetchall()
         return [ChatMessage(*row) for row in reversed(rows)]
+
+    def last_from(self, group_id: str, sender_id: str, before_timestamp: int) -> ChatMessage | None:
+        """The sender's most recent message sent before `before_timestamp`, if any."""
+        row = self._db.execute(
+            "SELECT group_id, sender_id, sender_name, timestamp, text FROM messages"
+            " WHERE group_id = ? AND sender_id = ? AND timestamp < ?"
+            " ORDER BY timestamp DESC LIMIT 1",
+            (group_id, sender_id, before_timestamp),
+        ).fetchone()
+        return ChatMessage(*row) if row else None
 
     def display_name(self, sender_id: str) -> str | None:
         row = self._db.execute(
