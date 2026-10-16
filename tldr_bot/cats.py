@@ -56,39 +56,48 @@ class CatGenClient:
         try:
             resp = await self._http.request(method, path, headers=self._auth, **kwargs)
             resp.raise_for_status()
-            return resp.json()
+            data = resp.json()
         except (httpx.HTTPError, ValueError) as e:
             raise CatError(f"{type(e).__name__}: {e}") from e
+        if not isinstance(data, dict):
+            raise CatError(f"Unexpected response from {path}: {data!r:.200}")
+        return data
 
     async def generate(self, prompt: str | None = None) -> tuple[str, bytes]:
         """Generate a cat picture and wait for the job to finish. Returns (content type, image bytes)."""
+        try:
+            async with asyncio.timeout(self.timeout):
+                url = await self._run_job(prompt)
+                resp = await self._http.get(url)  # No auth header: the image lives on another host.
+                resp.raise_for_status()
+        except TimeoutError as e:
+            raise CatError(f"Timed out after {self.timeout}s") from e
+        except httpx.HTTPError as e:
+            raise CatError(f"{type(e).__name__}: {e}") from e
+        content_type = resp.headers.get("content-type", "").split(";")[0].strip()
+        if not content_type.startswith("image/"):
+            raise CatError(f"Expected an image, got {content_type or 'no content type'}")
+        return content_type, resp.content
+
+    async def _run_job(self, prompt: str | None) -> str:
+        """Create a job and poll it until it's done. Returns the image URL."""
         if prompt:
             body = {"model": CAT_GEN_PROMPT_MODEL, "prompt": prompt[:PROMPT_MAX_LENGTH]}
         else:
             body = {"model": CAT_GEN_MODEL}
         job = await self._api("POST", "/api/v1/jobs", json=body)
+        job_id = job.get("id")
+        if not job_id:
+            raise CatError(f"Job response has no id: {job!r:.200}")
 
-        deadline = asyncio.get_running_loop().time() + self.timeout
         while job.get("state") != "done":
             if job.get("error") or job.get("state") in ("failed", "error", "cancelled", "canceled"):
-                raise CatError(f"Job {job.get('id')} {job['state']}: {job.get('error')}")
-            if asyncio.get_running_loop().time() > deadline:
-                raise CatError(f"Job {job.get('id')} timed out in state {job.get('state')}")
+                raise CatError(f"Job {job_id} {job.get('state')}: {job.get('error')}")
             await asyncio.sleep(self.poll_interval)
-            job = await self._api("GET", f"/api/v1/jobs/{job['id']}")
+            job = await self._api("GET", f"/api/v1/jobs/{job_id}")
 
         try:
-            url = job["images"][0]["url"]
+            return job["images"][0]["url"]
         except (KeyError, IndexError, TypeError) as e:
-            raise CatError(f"Job {job.get('id')} is done but has no image") from e
-        try:
-            # No auth header here: the image may live on another host.
-            resp = await self._http.get(url)
-            resp.raise_for_status()
-        except httpx.HTTPError as e:
-            raise CatError(f"{type(e).__name__}: {e}") from e
-        content_type = resp.headers.get("content-type", "").split(";")[0].strip()
-        if not content_type.startswith("image/"):
-            content_type = "image/png"
-        return content_type, resp.content
+            raise CatError(f"Job {job_id} is done but has no image") from e
 

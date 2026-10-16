@@ -116,13 +116,13 @@ def test_is_macka_command(text, expected):
 @pytest.mark.parametrize(
     "text, expected",
     [
-        ("/macka-gen", ""),
-        ("  /MACKA-GEN  ", ""),
-        ("/macka-gen a cat in a hat", "a cat in a hat"),
-        ("/macka-gen  multi\nline ", "multi\nline"),
+        ("/mackagen", ""),
+        ("  /MACKAGEN  ", ""),
+        ("/mackagen a cat in a hat", "a cat in a hat"),
+        ("/mackagen  multi\nline ", "multi\nline"),
         ("/macka", None),
-        ("/macka-genx", None),
-        ("hey /macka-gen", None),
+        ("/mackagenx", None),
+        ("hey /mackagen", None),
     ],
 )
 def test_parse_macka_gen(text, expected):
@@ -283,14 +283,14 @@ async def test_random_cat_rejects_non_image():
         await cats.random_cat()
 
 
-def cat_gen_api(jobs: list[dict], requests: list[httpx.Request]):
+def cat_gen_api(jobs: list, requests: list[httpx.Request], image=None):
     """A fake nano-catana API that serves the given job states in order."""
     states = iter(jobs)
 
     def handler(request: httpx.Request):
         requests.append(request)
         if request.url.host == "images":
-            return httpx.Response(200, content=b"PNG", headers={"content-type": "image/png"})
+            return image or httpx.Response(200, content=b"PNG", headers={"content-type": "image/png"})
         return httpx.Response(202 if request.method == "POST" else 200, json=next(states))
 
     cat_gen = CatGenClient("secret", base_url="http://catgen", poll_interval=0)
@@ -329,6 +329,28 @@ async def test_cat_gen_without_prompt():
 async def test_cat_gen_job_failed():
     cat_gen = cat_gen_api([{"id": "j1", "state": "failed", "images": [], "error": "GPU on fire"}], [])
     with pytest.raises(CatError, match="GPU on fire"):
+        await cat_gen.generate()
+
+
+async def test_cat_gen_rejects_non_image():
+    done = {"id": "j1", "state": "done", "images": [{"url": "http://images/j1/0.png"}], "error": None}
+    cat_gen = cat_gen_api([done], [], image=httpx.Response(200, text="<html>"))
+    with pytest.raises(CatError, match="Expected an image"):
+        await cat_gen.generate()
+
+
+@pytest.mark.parametrize("job", [None, {"state": "queued"}])
+async def test_cat_gen_malformed_job(job):
+    cat_gen = cat_gen_api([job], [])
+    with pytest.raises(CatError):
+        await cat_gen.generate()
+
+
+async def test_cat_gen_timeout():
+    cat_gen = cat_gen_api([{"id": "j1", "state": "queued"}] * 1000, [])
+    cat_gen.timeout = 0.05
+    cat_gen.poll_interval = 0.01
+    with pytest.raises(CatError, match="Timed out"):
         await cat_gen.generate()
 
 
@@ -645,8 +667,8 @@ async def test_macka_download_failure():
 
 async def test_macka_gen():
     bot = make_bot()
-    bot.handle(envelope(group_data("/macka-gen a cat in a hat", ts=10)))
-    bot.handle(envelope(group_data("/macka-gen", ts=11)))
+    bot.handle(envelope(group_data("/mackagen a cat in a hat", ts=10)))
+    bot.handle(envelope(group_data("/mackagen", ts=11)))
     for task in list(bot._tasks):
         await task
     assert bot.cat_gen.prompts == ["a cat in a hat", None]
@@ -657,7 +679,7 @@ async def test_macka_gen():
 async def test_macka_gen_not_configured():
     bot = make_bot()
     bot.cat_gen = None
-    bot.handle(envelope(group_data("/macka-gen", ts=10)))
+    bot.handle(envelope(group_data("/mackagen", ts=10)))
     for task in list(bot._tasks):
         await task
     [(_, text, _)] = bot.signal.sent

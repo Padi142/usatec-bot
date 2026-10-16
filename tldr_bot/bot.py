@@ -15,7 +15,7 @@ from .store import ChatMessage, MessageStore
 log = logging.getLogger(__name__)
 
 MACKA_RE = re.compile(r"^\s*/macka\s*$", re.IGNORECASE)
-MACKA_GEN_RE = re.compile(r"^\s*/macka-gen(?:\s+(.*?))?\s*$", re.IGNORECASE | re.DOTALL)
+MACKA_GEN_RE = re.compile(r"^\s*/mackagen(?:\s+(.*?))?\s*$", re.IGNORECASE | re.DOTALL)
 
 # CET/CEST. The tzdata package is a dependency because slim Docker images
 # often ship without the system zoneinfo database.
@@ -115,7 +115,7 @@ def is_macka_command(text: str) -> bool:
 
 
 def parse_macka_gen(text: str) -> str | None:
-    """Parse "/macka-gen [prompt]". Returns the prompt ("" if none), or None if it isn't the command."""
+    """Parse "/mackagen [prompt]". Returns the prompt ("" if none), or None if it isn't the command."""
     m = MACKA_GEN_RE.match(text)
     if not m:
         return None
@@ -185,7 +185,7 @@ class TldrBot:
                 log.info("/macka from %s in group %s", event.sender_name, event.group_id)
                 self._spawn(self.run_macka(event))
             case GroupMessage() if (prompt := parse_macka_gen(event.text)) is not None:
-                log.info("/macka-gen from %s in group %s", event.sender_name, event.group_id)
+                log.info("/mackagen from %s in group %s", event.sender_name, event.group_id)
                 self._spawn(self.run_macka_gen(event, prompt))
             case GroupMessage():
                 command = parse_command(event.text)
@@ -243,7 +243,7 @@ class TldrBot:
                 await self.signal.set_typing(msg.group_id, False)
             await self.reply(msg, "🐈", attachments=[cat])
         except Exception:
-            log.exception("/macka-gen failed")
+            log.exception("/mackagen failed")
 
     async def run_tldr(self, msg: GroupMessage, command: TldrCommand) -> None:
         try:
