@@ -1,8 +1,8 @@
 """Container healthcheck.
 
-While the bot is connected to the Signal API, it touches HEALTH_FILE every few seconds.
-`python -m tldr_bot.health` (the healthcheck in docker-compose.yml) fails when the file is missing or stale,
-which catches both a lost Signal connection and a stuck event loop.
+While a bot is connected, it touches HEALTH_FILE every few seconds.
+`python -m tldr_bot.health` (the Compose healthcheck) fails when the file is missing or stale,
+which catches both a lost connection and a stuck event loop.
 """
 
 import asyncio
@@ -10,17 +10,21 @@ import os
 import sys
 import time
 from pathlib import Path
-
-from .signal_api import SignalClient
+from typing import Protocol
 
 HEALTH_FILE = Path(os.environ.get("HEALTH_FILE", "/tmp/healthy"))
 INTERVAL = 15
 MAX_AGE = 60
 
 
-async def heartbeat(signal: SignalClient, path: Path = HEALTH_FILE, interval: float = INTERVAL) -> None:
+class Connection(Protocol):
+    @property
+    def connected(self) -> bool: ...
+
+
+async def heartbeat(connection: Connection, path: Path = HEALTH_FILE, interval: float = INTERVAL) -> None:
     while True:
-        if signal.connected:
+        if connection.connected:
             path.touch()
         else:
             path.unlink(missing_ok=True)

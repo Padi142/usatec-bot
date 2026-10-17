@@ -126,7 +126,8 @@ def test_is_macka_command(text, expected):
         ("/mackagen 2x2", MackaGenCommand(layout="2x2")),
         ("/mackagen 3X3 ", MackaGenCommand(layout="3x3")),
         ("/mackagen 2x2 a cat", MackaGenCommand(prompt="a cat", layout="2x2")),
-        ("/mackagen 4x4", MackaGenCommand(prompt="4x4")),
+        ("/mackagen 4x4", MackaGenCommand(layout="4x4")),
+        ("/mackagen 5X5", MackaGenCommand(layout="5x5")),
         ("/macka", None),
         ("/mackagenx", None),
         ("hey /mackagen", None),
@@ -333,19 +334,61 @@ async def test_cat_gen_without_prompt():
     assert json.loads(requests[0].content) == {"model": "cat-diffusion-v2"}
 
 
-async def test_cat_gen_grid():
+@pytest.mark.parametrize("layout", ["2x2", "3x3", "4x4", "5x5"])
+async def test_cat_gen_grid(layout):
     requests = []
     cat_gen = cat_gen_api(
         [{"id": "j1", "state": "done", "images": [{"url": "http://images/j1/0.png"}], "error": None}], requests
     )
-    await cat_gen.generate(layout="3x3")
-    assert json.loads(requests[0].content) == {"model": "cat-diffusion-v2", "layout": "3x3"}
+    await cat_gen.generate(layout=layout)
+    assert json.loads(requests[0].content) == {"model": "cat-diffusion-v2", "layout": layout}
+
+
+@pytest.mark.parametrize("model", ["cat-diffusion", "cat-diffusion-v2", "flowmatch-cats-tti"])
+async def test_cat_gen_model_and_seed(model):
+    requests = []
+    cat_gen = cat_gen_api(
+        [{"id": "j1", "state": "done", "images": [{"url": "http://images/j1/0.png"}]}], requests,
+    )
+    prompt = "a ginger cat" if model == "flowmatch-cats-tti" else None
+    await cat_gen.generate(prompt, model=model, seed=0)
+    body = json.loads(requests[0].content)
+    assert body == {"model": model, "seed": 0, **({"prompt": prompt} if prompt else {})}
+    await cat_gen.close()
+
+
+@pytest.mark.parametrize("options", [
+    {"prompt": "cat", "layout": "5x5"},
+    {"model": "cat-diffusion", "prompt": "cat"},
+    {"model": "flowmatch-cats-tti"},
+    {"model": "unknown"},
+    {"layout": "6x6"},
+    {"seed": -1},
+    {"seed": 2**32},
+    {"seed": 1.5},
+])
+async def test_cat_gen_invalid_options_do_not_submit(options):
+    requests = []
+    cat_gen = cat_gen_api([], requests)
+    try:
+        with pytest.raises(ValueError):
+            await cat_gen.generate(**options)
+        assert not requests
+    finally:
+        await cat_gen.close()
 
 
 async def test_cat_gen_job_failed():
     cat_gen = cat_gen_api([{"id": "j1", "state": "failed", "images": [], "error": "GPU on fire"}], [])
     with pytest.raises(CatError, match="GPU on fire"):
         await cat_gen.generate()
+
+
+async def test_cat_gen_expired_job():
+    cat_gen = cat_gen_api([{"id": "j1", "state": "expired"}], [])
+    with pytest.raises(CatError, match="expired"):
+        await cat_gen.generate()
+    await cat_gen.close()
 
 
 async def test_cat_gen_rejects_non_image():

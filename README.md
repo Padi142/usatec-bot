@@ -1,4 +1,4 @@
-# Signal TL;DR bot
+# Signal TL;DR and Discord cat bots
 
 A bot that lives in Signal group chats. When someone writes
 
@@ -23,8 +23,8 @@ more, only the newest ones are used.
 
 `/mackagen` generates a new cat with [nano-catana](https://research.kocicividea.cz/), using
 the `cat-diffusion-v2` model. `/mackagen a cat wearing a tiny hat` generates one from the prompt
-with the `flowmatch-cats-tti` text-to-cat model. `/mackagen 2x2` and `/mackagen 3x3` make a grid
-of 4 or 9 cats in one picture (only without a prompt). Generating takes around 20 seconds, and
+with the `flowmatch-cats-tti` text-to-cat model. `/mackagen 2x2`, `/mackagen 3x3`, `/mackagen 4x4`
+and `/mackagen 5x5` make a grid of 4, 9, 16 or 25 cats in one picture (only without a prompt). Generating takes around 20 seconds, and
 it needs `CAT_GEN_API_KEY` to be set.
 
 ## How it works
@@ -143,8 +143,9 @@ and run `docker compose up -d` again.
 1. Create the resource from this repo and set **Build Pack** to **Docker Compose**
    (Docker Compose location: `/docker-compose.yml`). Nixpacks won't work: it only
    builds the bot and leaves out the Signal API container.
-2. Under **Environment Variables**, set `SIGNAL_NUMBER` and `LLM_API_KEY`.
-   Don't add a domain; neither service should be reachable from outside.
+2. Under **Environment Variables**, set `SIGNAL_NUMBER`, `LLM_API_KEY`, `DISCORD_TOKEN`
+   and `CAT_GEN_API_KEY`. Optionally set `DISCORD_GUILD_ID` to register Discord commands in one server.
+   Don't add a domain; these services use outbound connections.
    Don't add port mappings either. Coolify publishes them on all interfaces
    (it drops a `127.0.0.1:` prefix), which would expose the unauthenticated Signal API.
 3. Deploy.
@@ -162,9 +163,14 @@ and run `docker compose up -d` again.
    step 3a or 3b above with `localhost:8080`.
 5. Once the account is linked, use **Restart** in Coolify so the Signal API picks up the account.
 
-Both services have healthchecks in `docker-compose.yml`, which Coolify shows as the app's status.
+All three services have healthchecks in `docker-compose.yml`, which Coolify shows as the app's status.
 The Signal API is healthy when its `/v1/health` endpoint answers. The bot is healthy while it's
 connected to the Signal API, so it shows as unhealthy until the account is linked.
+The Discord bot becomes healthy once its gateway connection is ready.
+
+For an existing Signal application, keep `/docker-compose.yml` as the Compose location,
+load this updated definition, set `DISCORD_TOKEN` and `CAT_GEN_API_KEY`, and redeploy.
+The existing Signal volumes keep the linked account and message history.
 
 ## Running without Docker
 
@@ -174,6 +180,60 @@ You still need `signal-cli-rest-api` running somewhere (step 1). Then:
 uv sync
 uv run --env-file .env python -m tldr_bot   # with SIGNAL_API_URL=http://localhost:8080 in .env
 ```
+
+## Discord cat bot
+
+The Discord bot runs in its own container alongside Signal and shares its cat API client. It has native slash commands:
+
+- `/macka` — a random cat picture.
+- `/mackagen` — generate a cat, with optional `prompt`, `model`, `layout` and `seed` fields.
+
+Model choices are **Automatic**, **Cat diffusion v2**, **Cat diffusion (original)** and **Text-to-cat**.
+Automatic picks text-to-cat when you enter a prompt, otherwise cat diffusion v2. Prompts can have
+up to 500 characters. Layout choices are single, 2×2, 3×3, 4×4 and 5×5; grids require a
+cat-diffusion model and no prompt. A seed from 0 to 4294967295 lets you repeat a generation;
+leave it empty for a random seed. These are all the options exposed by the client API;
+steps and guidance use its model defaults.
+
+For example, `/mackagen layout:5x5 seed:42` generates 25 cats in one image, and
+`/mackagen prompt:a ginger cat wearing a hat` uses text-to-cat.
+
+1. Create an application in the [Discord Developer Portal](https://discord.com/developers/applications).
+   On its **Bot** page, generate a token and set `DISCORD_TOKEN` in `.env`. Set `CAT_GEN_API_KEY` too.
+2. Under **OAuth2 → URL Generator**, select the `bot` and `applications.commands` scopes and
+   the **View Channels**, **Send Messages** and **Attach Files** permissions. Open the generated URL
+   to invite the bot to your server. No privileged intents are needed.
+3. Optionally set `DISCORD_GUILD_ID` to your server ID to register commands only there.
+   Without it, commands register globally. To copy a server ID, enable **Developer Mode** in
+   Discord's advanced settings, then right-click the server and choose **Copy Server ID**.
+4. Start the bot:
+
+   ```sh
+   uv sync
+   uv run --env-file .env python -m tldr_bot.discord_bot
+   ```
+
+   Or run both bots with Docker Compose, using the Signal configuration described above:
+
+   ```sh
+   docker compose up -d --build
+   docker compose logs -f discord-bot
+   ```
+
+The bot registers slash commands on startup and uploads generated pictures as attachments.
+The cat API must include the 4×4 and 5×5 layout update before those layouts work against it.
+
+### Discord on Coolify
+
+Use the existing Signal application with **Docker Compose** as its build pack,
+**Base Directory** `/` and **Docker Compose Location** `/docker-compose.yml`.
+Keep the Signal settings and add `DISCORD_TOKEN` and `CAT_GEN_API_KEY`; optionally set
+`DISCORD_GUILD_ID` to register commands in one server. Leave domains and port mappings empty:
+the bot connects to Discord over an outbound connection.
+
+Deploy the application and check its logs for `Synced 2 Discord slash commands` and the Discord
+gateway connection. The Compose healthcheck becomes healthy once Discord is ready, and detects
+a lost connection or a stalled event loop. Invite the bot as described above before trying `/mackagen`.
 
 ## Tests
 

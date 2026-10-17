@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
-from .cats import CatClient, CatError, CatGenClient
+from .cats import GRID_LAYOUTS, CatClient, CatError, CatGenClient
 from .config import Config
 from .llm import LLMClient, LLMError
 from .signal_api import GroupDelete, GroupEdit, GroupMessage, SignalClient, parse_event, render_mentions
@@ -16,7 +16,6 @@ log = logging.getLogger(__name__)
 
 MACKA_RE = re.compile(r"^\s*/macka\s*$", re.IGNORECASE)
 MACKA_GEN_RE = re.compile(r"^\s*/mackagen(?:\s+(.*?))?\s*$", re.IGNORECASE | re.DOTALL)
-GRID_LAYOUTS = ("2x2", "3x3")
 
 # CET/CEST. The tzdata package is a dependency because slim Docker images
 # often ship without the system zoneinfo database.
@@ -122,7 +121,7 @@ class MackaGenCommand:
 
 
 def parse_macka_gen(text: str) -> MackaGenCommand | None:
-    """Parse "/mackagen [2x2|3x3] [prompt]". Returns None if the text isn't a /mackagen command."""
+    """Parse "/mackagen [2x2|3x3|4x4|5x5] [prompt]". Returns None for other commands."""
     m = MACKA_GEN_RE.match(text)
     if not m:
         return None

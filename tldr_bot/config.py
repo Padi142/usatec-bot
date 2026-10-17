@@ -21,6 +21,24 @@ def _float(name: str, default: float) -> float:
     return float(raw) if raw else default
 
 
+@dataclass(frozen=True)
+class DiscordConfig:
+    token: str
+    cat_gen_api_key: str
+    guild_id: int | None = None
+
+    @classmethod
+    def from_env(cls) -> "DiscordConfig":
+        guild = os.environ.get("DISCORD_GUILD_ID", "").strip()
+        if guild and (not guild.isdecimal() or int(guild) <= 0):
+            raise SystemExit("DISCORD_GUILD_ID must be a positive server ID")
+        return cls(
+            token=_require("DISCORD_TOKEN"),
+            cat_gen_api_key=_require("CAT_GEN_API_KEY"),
+            guild_id=int(guild) if guild else None,
+        )
+
+
 def normalize_group_id(group_id: str) -> str:
     """Accept either the REST API form ("group.<base64>") or signal-cli's internal id.
 

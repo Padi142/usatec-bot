@@ -46,6 +46,22 @@ services:
       - signal-api
     restart: unless-stopped
 
+  discord-bot:
+    build: .
+    command: [".venv/bin/python", "-m", "tldr_bot.discord_bot"]
+    environment:
+      - DISCORD_TOKEN=${DISCORD_TOKEN:?}
+      - CAT_GEN_API_KEY=${CAT_GEN_API_KEY:?}
+      - DISCORD_GUILD_ID=${DISCORD_GUILD_ID:-}
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+    healthcheck:
+      test: ["CMD", "/app/.venv/bin/python", "-m", "tldr_bot.health"]
+      interval: 30s
+      timeout: 10s
+      start_period: 60s
+      retries: 3
+    restart: unless-stopped
+
 volumes:
   signal-cli-data:
   bot-data:
