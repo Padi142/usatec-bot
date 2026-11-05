@@ -12,6 +12,10 @@ CREATE TABLE IF NOT EXISTS messages (
     UNIQUE (group_id, sender_id, timestamp)
 );
 CREATE INDEX IF NOT EXISTS idx_messages_group_ts ON messages (group_id, timestamp);
+CREATE TABLE IF NOT EXISTS settings (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
 """
 
 # Pruning on every insert is wasteful; do it every N inserts instead.
@@ -98,6 +102,22 @@ class MessageStore:
             (sender_id,),
         ).fetchone()
         return row[0] if row else None
+
+    def setting(self, key: str) -> str | None:
+        row = self._db.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
+        return row[0] if row else None
+
+    def set_setting(self, key: str, value: str | None) -> None:
+        """Store a setting that survives restarts. None removes it."""
+        with self._db:
+            if value is None:
+                self._db.execute("DELETE FROM settings WHERE key = ?", (key,))
+            else:
+                self._db.execute(
+                    "INSERT INTO settings (key, value) VALUES (?, ?)"
+                    " ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+                    (key, value),
+                )
 
     def prune(self) -> None:
         """Keep only the newest `history_limit` messages per group."""

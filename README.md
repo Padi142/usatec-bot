@@ -14,10 +14,16 @@ It also understands:
 
 - `/tldr since HH:MM` — summarize everything since that time (in CET/CEST);
   if the time is later today, it summarizes since that time yesterday,
-- `/tldr afk` — summarize everything since your last message.
+- `/tldr afk` — summarize everything since your last message,
+- `/tldr <slug>`, `/tldr 50 <slug>`, `/tldr afk <slug>` — any form can end with a
+  model slug, which is used for that one summary.
 
 All forms summarize at most `TLDR_MAX_COUNT` (500) messages — when there are
 more, only the newest ones are used.
+
+`/model` shows the current LLM model and the available ones with their live status.
+`/model <slug>` changes the model for everyone and survives restarts; `/model default`
+goes back to `LLM_MODEL`.
 
 `/macka` replies with a random cat picture from [kocicividea.cz](https://kocicividea.cz/).
 

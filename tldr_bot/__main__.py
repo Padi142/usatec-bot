@@ -15,7 +15,7 @@ async def main() -> None:
     cfg = Config.from_env()
     store = MessageStore(cfg.db_path, cfg.history_limit)
     signal = SignalClient(cfg.signal_api_url, cfg.signal_number)
-    llm = LLMClient(cfg.llm_base_url, cfg.llm_model, cfg.llm_api_key, cfg.llm_timeout)
+    llm = LLMClient(cfg.llm_base_url, cfg.llm_api_key, cfg.llm_timeout)
     cats = CatClient()
     cat_gen = CatGenClient(cfg.cat_gen_api_key) if cfg.cat_gen_api_key else None
     health = asyncio.create_task(heartbeat(signal))

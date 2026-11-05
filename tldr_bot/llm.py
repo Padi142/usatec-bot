@@ -1,8 +1,12 @@
 """Client for any OpenAI-compatible /chat/completions endpoint."""
 
+import logging
 import re
+from dataclasses import dataclass, replace
 
 import httpx
+
+log = logging.getLogger(__name__)
 
 SYSTEM_PROMPT = """\
 You summarize Signal group chat conversations for people who missed them.
@@ -30,26 +34,83 @@ Rules:
 
 _THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
 
+# Public e-INFRA status API. It reports real model names, not aliases like "deepseek".
+STATUS_URL = "https://llm.ai.e-infra.cz/status/api/v1/models"
+# Model lookups shouldn't wait as long as a summary might.
+LOOKUP_TIMEOUT = 15.0
+# /v1/models also lists models that can't chat, which would only fail in /tldr.
+_NON_CHAT_RE = re.compile(r"embed|rerank|whisper|canary|-e5-", re.IGNORECASE)
+
+
+@dataclass(frozen=True)
+class ModelInfo:
+    slug: str
+    online: bool | None = None  # None means the status API doesn't report this slug
+    waiting: int = 0  # requests queued on the model
+
 
 class LLMError(Exception):
     pass
 
 
 class LLMClient:
-    def __init__(self, base_url: str, model: str, api_key: str | None, timeout: float):
+    def __init__(self, base_url: str, api_key: str | None, timeout: float):
         headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
-        self.model = model
         self._http = httpx.AsyncClient(base_url=base_url, headers=headers, timeout=timeout)
+        # Separate client, so the API key never goes to the status host.
+        self._status_http = httpx.AsyncClient(timeout=LOOKUP_TIMEOUT)
 
     async def close(self) -> None:
         await self._http.aclose()
+        await self._status_http.aclose()
 
-    async def summarize(self, transcript: str) -> str:
+    async def available_models(self) -> list[ModelInfo]:
+        """Chat models the API offers, with their live status where it's known.
+
+        Raises LLMError if the list can't be fetched. A status API failure only
+        leaves the models without a status.
+        """
+        try:
+            resp = await self._http.get("/models", timeout=LOOKUP_TIMEOUT)
+            resp.raise_for_status()
+            slugs = [m["id"] for m in resp.json()["data"]]
+        except httpx.HTTPStatusError as e:
+            raise LLMError(f"HTTP {e.response.status_code}: {e.response.text[:300]}") from e
+        except (httpx.HTTPError, KeyError, TypeError, ValueError) as e:
+            raise LLMError(f"{type(e).__name__}: {e}") from e
+
+        statuses = await self._fetch_statuses()
+        return [
+            replace(statuses.get(slug.lower(), ModelInfo(slug)), slug=slug)
+            for slug in sorted(set(slugs))
+            if not _NON_CHAT_RE.search(slug)
+        ]
+
+    async def _fetch_statuses(self) -> dict[str, ModelInfo]:
+        """Live models from the status API, keyed by lowercase name. Empty on failure."""
+        try:
+            resp = await self._status_http.get(STATUS_URL)
+            resp.raise_for_status()
+            return {
+                m["model_name"].lower(): ModelInfo(
+                    m["model_name"],
+                    m["status"] == "online",
+                    # An idle model reports an empty object instead of a number.
+                    int(w) if isinstance(w := m["latest"].get("num_requests_waiting"), int | float) else 0,
+                )
+                for m in resp.json()
+                if m["status"] != "archived"
+            }
+        except (httpx.HTTPError, KeyError, TypeError, ValueError, AttributeError) as e:
+            log.warning("Model status lookup failed: %s", e)
+            return {}
+
+    async def summarize(self, transcript: str, model: str) -> str:
         try:
             resp = await self._http.post(
                 "/chat/completions",
                 json={
-                    "model": self.model,
+                    "model": model,
                     "messages": [
                         {"role": "system", "content": SYSTEM_PROMPT},
                         {"role": "user", "content": f"<transcript>\n{transcript}\n</transcript>"},

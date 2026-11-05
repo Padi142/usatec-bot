@@ -16,12 +16,15 @@ from tldr_bot.bot import (
     parse_command,
     MackaGenCommand,
     parse_macka_gen,
+    parse_model_command,
+    ModelCommand,
+    format_models,
     resolve_since_time,
 )
 from tldr_bot.cats import CatClient, CatError, CatGenClient
 from tldr_bot.config import Config, normalize_group_id
 from tldr_bot.health import heartbeat, is_healthy
-from tldr_bot.llm import LLMClient, LLMError
+from tldr_bot.llm import STATUS_URL, LLMClient, LLMError, ModelInfo
 from tldr_bot.signal_api import (
     GroupDelete,
     GroupEdit,
@@ -66,15 +69,17 @@ def group_data(message="hi", ts=1000, **extra):
         ("/tldr afk", TldrCommand(afk=True)),
         ("  /TLDR   AFK  ", TldrCommand(afk=True)),
         ("/tldr 0", TldrCommand(error="usage")),
-        ("/tldr abc", TldrCommand(error="usage")),
-        ("/tldr 5 more", TldrCommand(error="usage")),
+        ("/tldr glm", TldrCommand(model="glm")),
+        ("/tldr 5 glm", TldrCommand(count=5, model="glm")),
+        ("/tldr since 14:01 glm-5.3", TldrCommand(since=(14, 1), model="glm-5.3")),
+        ("/tldr afk glm", TldrCommand(afk=True, model="glm")),
+        ("/tldr 5 glm more", TldrCommand(error="usage")),
+        ("/tldr since glm", TldrCommand(error="usage")),
         ("/tldr since", TldrCommand(error="usage")),
         ("/tldr since 25:00", TldrCommand(error="usage")),
         ("/tldr since 12:60", TldrCommand(error="usage")),
         ("/tldr since 1401", TldrCommand(error="usage")),
-        ("/tldr since 14:01 pm", TldrCommand(error="usage")),
         ("/tldr since 14:01 15:02", TldrCommand(error="usage")),
-        ("/tldr afk now", TldrCommand(error="usage")),
         ("/tldr 14:01", TldrCommand(error="usage")),
         ("hello", None),
         ("/tldrx", None),
@@ -106,6 +111,24 @@ def test_format_since():
     now = datetime(2026, 6, 5, 16, 23, tzinfo=LOCAL_TZ)
     assert format_since(datetime(2026, 6, 5, 14, 1, tzinfo=LOCAL_TZ), now) == "14:01"
     assert format_since(datetime(2026, 6, 4, 23, 15, tzinfo=LOCAL_TZ), now) == "2026-06-04 23:15"
+
+
+@pytest.mark.parametrize("text, expected", [
+    ("/model", ModelCommand()),
+    ("/MODEL glm", ModelCommand(slug="glm")),
+    ("/model a b", ModelCommand()),
+    ("/modelx", None),
+])
+def test_parse_model_command(text, expected):
+    assert parse_model_command(text) == expected
+
+
+def test_format_models():
+    text = format_models(
+        [ModelInfo("deepseek"), ModelInfo("kimi"), ModelInfo("kimi-k3", False), ModelInfo("glm-5.3", True, 2)],
+        "glm-5.3",
+    )
+    assert text == "🟢 glm-5.3 (2 queued)  <- current\n🔴 kimi-k3\n\nNo live status: deepseek, kimi"
 
 
 @pytest.mark.parametrize(
@@ -254,6 +277,30 @@ def test_build_transcript_uses_prague_time():
 
 # --- LLM client --------------------------------------------------------------
 
+async def test_available_models_joins_status_and_drops_non_chat():
+    llm = LLMClient("http://llm/v1", "sk-test", 10)
+    llm._http._transport = httpx.MockTransport(lambda r: httpx.Response(200, json={"data": [
+        {"id": "deepseek"}, {"id": "glm-5.3"}, {"id": "kimi-k3"}, {"id": "qwen3-embedding-4b"},
+    ]}))
+
+    def status(request: httpx.Request):
+        assert str(request.url) == STATUS_URL
+        assert "authorization" not in request.headers
+        return httpx.Response(200, json=[
+            {"model_name": "Glm-5.3", "status": "online", "latest": {"num_requests_waiting": 3}},
+            {"model_name": "Kimi-k3", "status": "down", "latest": {"num_requests_waiting": {}}},
+            {"model_name": "Old", "status": "archived", "latest": {}},
+        ])
+
+    llm._status_http._transport = httpx.MockTransport(status)
+    assert await llm.available_models() == [
+        ModelInfo("deepseek"), ModelInfo("glm-5.3", True, 3), ModelInfo("kimi-k3", False),
+    ]
+
+    llm._status_http._transport = httpx.MockTransport(lambda r: httpx.Response(500))
+    assert ModelInfo("glm-5.3") in await llm.available_models()
+
+
 async def test_llm_summarize_strips_think():
     def handler(request: httpx.Request):
         body = json.loads(request.content)
@@ -262,16 +309,16 @@ async def test_llm_summarize_strips_think():
         assert "<transcript>" in body["messages"][1]["content"]
         return httpx.Response(200, json={"choices": [{"message": {"content": "<think>hmm</think>\nSummary"}}]})
 
-    llm = LLMClient("http://llm/v1", "m", "sk-test", 10)
+    llm = LLMClient("http://llm/v1", "sk-test", 10)
     llm._http._transport = httpx.MockTransport(handler)
-    assert await llm.summarize("[t] A: hi") == "Summary"
+    assert await llm.summarize("[t] A: hi", "m") == "Summary"
 
 
 async def test_llm_error():
-    llm = LLMClient("http://llm/v1", "m", None, 10)
+    llm = LLMClient("http://llm/v1", None, 10)
     llm._http._transport = httpx.MockTransport(lambda r: httpx.Response(500, text="boom"))
     with pytest.raises(LLMError, match="HTTP 500"):
-        await llm.summarize("x")
+        await llm.summarize("x", "m")
 
 
 # --- cat client --------------------------------------------------------------
@@ -461,9 +508,14 @@ class FakeCatGen:
 class FakeLLM:
     def __init__(self):
         self.transcripts = []
+        self.models = []
 
-    async def summarize(self, transcript):
+    async def available_models(self):
+        return [ModelInfo("deepseek"), ModelInfo("glm-5.3", True), ModelInfo("kimi-k3", False)]
+
+    async def summarize(self, transcript, model):
         self.transcripts.append(transcript)
+        self.models.append(model)
         return "they talked"
 
 
@@ -476,6 +528,41 @@ def make_bot(**overrides):
     )
     cfg = Config(**(settings | overrides))
     return TldrBot(cfg, MessageStore(":memory:", 1000), FakeSignal(), FakeLLM(), FakeCats(), FakeCatGen())
+
+
+async def send_command(bot, text, ts):
+    """Handle a command, wait for it to finish and return the bot's reply."""
+    bot.handle(envelope(group_data(text, ts=ts)))
+    for task in list(bot._tasks):
+        await task
+    return bot.signal.sent[-1][1]
+
+
+async def test_model_command_changes_default_and_tldr_can_override():
+    bot = make_bot()
+    bot.handle(envelope(group_data("hello", ts=1)))
+
+    listing = await send_command(bot, "/model", 2)
+    assert listing.startswith("Current model: m\n")
+    assert "🟢 glm-5.3" in listing and "🔴 kimi-k3" in listing
+
+    assert "don't know" in await send_command(bot, "/model nope", 3)
+    assert bot.current_model == "m"
+
+    assert await send_command(bot, "/model GLM-5.3", 4) == "Model changed to glm-5.3"
+    assert "down" in await send_command(bot, "/model kimi-k3", 5)
+    assert await send_command(bot, "/model glm-5.3", 6) == "Model changed to glm-5.3"
+
+    await send_command(bot, "/tldr", 7)
+    assert "using deepseek" in await send_command(bot, "/tldr deepseek", 8)
+    assert bot.llm.models == ["glm-5.3", "deepseek"]
+    assert "don't know" in await send_command(bot, "/tldr nope", 9)
+    assert bot.llm.models == ["glm-5.3", "deepseek"]
+
+    assert "reset" in await send_command(bot, "/model default", 10)
+    assert bot.current_model == "m"
+    # Commands aren't chat, so they must not end up in summaries.
+    assert [m.text for m in bot.store.last_before(GROUP, 100, 100)] == ["hello"]
 
 
 async def test_tldr_end_to_end():
@@ -654,7 +741,7 @@ async def test_tldr_afk_no_previous_message():
 
 async def test_usage_mentions_new_forms():
     bot = make_bot()
-    bot.handle(envelope(group_data("/tldr xyz", ts=1)))
+    bot.handle(envelope(group_data("/tldr 0", ts=1)))
     for task in list(bot._tasks):
         await task
     [(_, text, _)] = bot.signal.sent
@@ -672,7 +759,7 @@ async def test_only_one_tldr_at_a_time():
     bot = make_bot()
     release = asyncio.Event()
 
-    async def slow_summarize(transcript):
+    async def slow_summarize(transcript, model):
         await release.wait()
         return "done"
 
@@ -681,7 +768,7 @@ async def test_only_one_tldr_at_a_time():
     bot.handle(envelope(group_data("/tldr", ts=10)))
     await asyncio.sleep(0)  # let the first request start
     bot.handle(envelope(group_data("/tldr", ts=11)))
-    bot.handle(envelope(group_data("/tldr abc", ts=12)))  # usage help isn't blocked
+    bot.handle(envelope(group_data("/tldr 0", ts=12)))  # usage help isn't blocked
     await asyncio.sleep(0)
 
     texts = [t for _, t, _ in bot.signal.sent]
