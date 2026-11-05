@@ -1,7 +1,7 @@
 import asyncio
 import logging
 import re
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -44,6 +44,7 @@ log = logging.getLogger(__name__)
 
 MACKA_RE = re.compile(r"^\s*/macka\s*$", re.IGNORECASE)
 MACKA_GEN_RE = re.compile(r"^\s*/mackagen(?:\s+(.*?))?\s*$", re.IGNORECASE | re.DOTALL)
+PROMPT_RE = re.compile(r"^\s*/prompt(?:\s+(\S+)(?:\s+(.*?))?)?\s*$", re.IGNORECASE | re.DOTALL)
 
 # CET/CEST. The tzdata package is a dependency because slim Docker images
 # often ship without the system zoneinfo database.
@@ -197,6 +198,18 @@ def parse_model_command(text: str) -> ModelCommand | None:
     return ModelCommand(slug=words[1] if len(words) == 2 else None)
 
 
+@dataclass(frozen=True)
+class PromptCommand:
+    slug: str | None = None
+    prompt: str | None = None  # the command only runs with both, otherwise it shows the usage
+
+
+def parse_prompt_command(text: str) -> PromptCommand | None:
+    """Parse "/prompt <slug> <prompt>". Returns None for other commands."""
+    m = PROMPT_RE.match(text)
+    return PromptCommand(slug=m[1], prompt=m[2] or None) if m else None
+
+
 def find_model(models: list[ModelInfo], slug: str) -> ModelInfo | None:
     """Look up a slug the way a phone keyboard might capitalize it."""
     return next((m for m in models if m.slug.lower() == slug.lower()), None)
@@ -291,6 +304,12 @@ class TldrBot:
             case GroupMessage() if (model_command := parse_model_command(event.text)) is not None:
                 log.info("/model from %s in group %s", event.sender_name, event.group_id)
                 self._spawn(self.run_model(event, model_command))
+            # The body, so that a /prompt sent as a reply still counts as one.
+            case GroupMessage() if (prompt_command := parse_prompt_command(
+                render_mentions(event.body or "", event.mentions, self.store.display_name)
+            )) is not None:
+                log.info("/prompt from %s in group %s", event.sender_name, event.group_id)
+                self._spawn(self.run_prompt(event, prompt_command))
             case GroupMessage() if (react_command := parse_react_command(event.text)) is not None:
                 log.info("/react from %s in group %s", event.sender_name, event.group_id)
                 self._spawn(self.run_react_command(event, react_command))
@@ -510,34 +529,63 @@ class TldrBot:
             )
             return
 
-        model = await self._resolve_tldr_model(msg, command)
+        model = self.current_model if command.model is None else await self._resolve_model(msg, command.model)
         if model is None:
             return
+        await self._one_per_model(msg, model, lambda: self._summarize(msg, command, model))
 
+    async def _resolve_model(self, msg: GroupMessage, slug: str) -> str | None:
+        """The exact slug of a chat model. On None, the sender has already been told why."""
+        try:
+            found = find_model(await self.llm.available_models(), slug)
+        except LLMError as e:
+            log.error("Model list failed: %s", e)
+            await self.reply(msg, f"I couldn't check the model {slug} right now.")
+            return None
+        if found is None:
+            await self.reply(msg, f"I don't know the model {slug}. /model lists the available ones.")
+            return None
+        return found.slug
+
+    async def _one_per_model(self, msg: GroupMessage, model: str, generate: Callable[[], Awaitable[None]]) -> None:
+        """Run a generation, unless this model already has one running."""
         # No await between the check and the add, so this can't race.
         if model in self._busy_models:
-            await self.reply(msg, f"I'm still working on another summary with {model}, try again once it's done.")
+            await self.reply(msg, f"I'm still working on another request with {model}, try again once it's done.")
             return
         self._busy_models.add(model)
         try:
-            await self._summarize(msg, command, model)
+            await generate()
         finally:
             self._busy_models.discard(model)
 
-    async def _resolve_tldr_model(self, msg: GroupMessage, command: TldrCommand) -> str | None:
-        """The slug this summary should use. On None, the caller has already been told why."""
-        if command.model is None:
-            return self.current_model
+    async def run_prompt(self, msg: GroupMessage, command: PromptCommand) -> None:
         try:
-            found = find_model(await self.llm.available_models(), command.model)
+            await self._run_prompt(msg, command)
+        except Exception:
+            log.exception("/prompt failed")
+
+    async def _run_prompt(self, msg: GroupMessage, command: PromptCommand) -> None:
+        if command.slug is None or command.prompt is None:
+            await self.reply(msg, "Usage: /prompt <slug> <prompt>\n/model lists the available slugs.")
+            return
+        model = await self._resolve_model(msg, command.slug)
+        if model is None:
+            return
+        prompt = command.prompt  # keeps the narrowed type inside the lambda
+        await self._one_per_model(msg, model, lambda: self._answer_prompt(msg, prompt, model))
+
+    async def _answer_prompt(self, msg: GroupMessage, prompt: str, model: str) -> None:
+        await self.signal.set_typing(msg.group_id, True)
+        try:
+            answer = await self.llm.prompt(prompt, model)
         except LLMError as e:
-            log.error("Model list failed: %s", e)
-            await self.reply(msg, f"I couldn't check the model {command.model} right now.")
-            return None
-        if found is None:
-            await self.reply(msg, f"I don't know the model {command.model}. /model lists the available ones.")
-            return None
-        return found.slug
+            log.error("LLM request failed: %s", e)
+            await self.reply(msg, f"Sorry, I couldn't get a response from {model} right now.")
+            return
+        finally:
+            await self.signal.set_typing(msg.group_id, False)
+        await self.reply(msg, answer)
 
     async def _summarize(self, msg: GroupMessage, command: TldrCommand, model: str) -> None:
         max_count = self.cfg.max_count

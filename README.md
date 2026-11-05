@@ -40,6 +40,10 @@ Rules apply to all groups and survive restarts. Direct messages only accept `/re
 from someone who has already written in one of the bot's groups; everyone else is ignored. If the
 bot is linked to your own account, use Note to Self for this.
 
+`/prompt <slug> <prompt>` sends a prompt to a chat model and replies with its answer. It takes the
+same slugs as `/model`, so embedding and decision models are rejected. Each model works on one
+request at a time, shared with `/tldr`. Signal doesn't render Markdown, so it shows up as plain text.
+
 `/macka` replies with a random cat picture from [kocicividea.cz](https://kocicividea.cz/).
 
 `/mackagen` generates a new cat with [nano-catana](https://research.kocicividea.cz/), using

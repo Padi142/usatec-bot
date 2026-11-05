@@ -144,17 +144,24 @@ class LLMClient:
             return Choice(answer["choice"], answer["confidence"])
 
     async def summarize(self, transcript: str, model: str) -> str:
+        return await self._chat(
+            model,
+            [
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": f"<transcript>\n{transcript}\n</transcript>"},
+            ],
+            temperature=0.3,
+        )
+
+    async def prompt(self, text: str, model: str) -> str:
+        """Send a prompt as it is, with the model's default settings."""
+        return await self._chat(model, [{"role": "user", "content": text}])
+
+    async def _chat(self, model: str, messages: list[dict[str, str]], temperature: float | None = None) -> str:
+        options = {} if temperature is None else {"temperature": temperature}
         with _llm_errors():
             resp = await self._http.post(
-                "/chat/completions",
-                json={
-                    "model": model,
-                    "messages": [
-                        {"role": "system", "content": SYSTEM_PROMPT},
-                        {"role": "user", "content": f"<transcript>\n{transcript}\n</transcript>"},
-                    ],
-                    "temperature": 0.3,
-                },
+                "/chat/completions", json={"model": model, "messages": messages, **options},
             )
             resp.raise_for_status()
             content = resp.json()["choices"][0]["message"]["content"]

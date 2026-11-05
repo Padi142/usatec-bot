@@ -18,6 +18,8 @@ from tldr_bot.bot import (
     MackaGenCommand,
     parse_macka_gen,
     parse_model_command,
+    parse_prompt_command,
+    PromptCommand,
     ModelCommand,
     format_models,
     resolve_since_time,
@@ -156,6 +158,18 @@ def test_parse_react_command(text, expected):
 ])
 def test_is_emoji(text, expected):
     assert is_emoji(text) is expected
+
+
+@pytest.mark.parametrize("text, expected", [
+    ("/prompt", PromptCommand()),
+    ("/prompt glm", PromptCommand(slug="glm")),
+    ("/PROMPT glm-5.3  what is 2+2? ", PromptCommand(slug="glm-5.3", prompt="what is 2+2?")),
+    ("/prompt glm line one\nline two", PromptCommand(slug="glm", prompt="line one\nline two")),
+    ("/promptx glm hi", None),
+    ("hello /prompt glm hi", None),
+])
+def test_parse_prompt_command(text, expected):
+    assert parse_prompt_command(text) == expected
 
 
 def test_format_models():
@@ -587,7 +601,15 @@ class FakeLLM:
         self.transcripts = []
         self.models = []
         self.decisions = []
+        self.prompts = []
+        self.prompt_error = None
         self.reaction_choice = Choice("none", 0.99)
+
+    async def prompt(self, text, model):
+        self.prompts.append((text, model))
+        if self.prompt_error:
+            raise self.prompt_error
+        return "the answer"
 
     async def choose(self, state, instructions, criteria, model):
         self.decisions.append((state, criteria, model))
@@ -653,6 +675,80 @@ async def test_model_command_changes_default_and_tldr_can_override():
 async def finish_tasks(bot):
     while bot._tasks:
         await asyncio.gather(*bot._tasks)
+
+
+async def test_prompt_replies_with_the_answer_of_the_chosen_model():
+    bot = make_bot()
+    assert await send_command(bot, "/prompt GLM-5.3 what is 2+2?", 1) == "the answer"
+    assert bot.llm.prompts == [("what is 2+2?", "glm-5.3")]
+    # Commands aren't chat: not summarized, and no reaction.
+    assert bot.store.last_before(GROUP, 100, 100) == [] and bot.llm.decisions == []
+
+
+async def test_prompt_as_a_reply_only_sends_what_was_typed():
+    bot = make_bot()
+    bot.handle(envelope(group_data("/prompt deepseek hi", ts=1, quote={"text": "secret"})))
+    await finish_tasks(bot)
+    assert bot.llm.prompts == [("hi", "deepseek")]
+
+
+@pytest.mark.parametrize("text, expected", [
+    ("/prompt", "Usage:"),
+    ("/prompt glm-5.3", "Usage:"),
+    ("/prompt vllm-sr-d3-flash hi", "I don't know the model vllm-sr-d3-flash"),
+])
+async def test_prompt_without_a_usable_model_or_text_sends_nothing(text, expected):
+    bot = make_bot()
+    assert (await send_command(bot, text, 1)).startswith(expected)
+    assert bot.llm.prompts == []
+
+
+async def test_prompt_renders_mentions():
+    bot = make_bot()
+    mention = {"start": 20, "length": 1, "uuid": "uuid-bob", "name": "Bob"}
+    bot.handle(envelope(group_data("/prompt deepseek hi \ufffc!", ts=1, mentions=[mention])))
+    await finish_tasks(bot)
+    assert bot.llm.prompts == [("hi @Bob!", "deepseek")]
+
+
+async def test_prompt_failure_is_reported():
+    bot = make_bot()
+    bot.llm.prompt_error = LLMError("down")
+    assert "couldn't get a response from glm-5.3" in await send_command(bot, "/prompt glm-5.3 hi", 1)
+
+
+async def test_prompt_shares_the_per_model_lock_with_tldr():
+    bot = make_bot()
+    release = asyncio.Event()
+
+    async def slow_prompt(text, model):
+        await release.wait()
+        return "done"
+
+    bot.llm.prompt = slow_prompt
+    bot.handle(envelope(group_data("hello", ts=1)))
+    bot.handle(envelope(group_data("/prompt glm-5.3 hi", ts=2)))
+    await asyncio.sleep(0.01)
+    bot.handle(envelope(group_data("/tldr glm-5.3", ts=3)))
+    bot.handle(envelope(group_data("/tldr deepseek", ts=4)))
+    await asyncio.sleep(0.01)
+
+    assert [t for _, t, _ in bot.signal.sent if "still working" in t] == [
+        "I'm still working on another request with glm-5.3, try again once it's done."
+    ]
+    assert bot.llm.models == ["deepseek"]
+    release.set()
+    await finish_tasks(bot)
+
+
+async def test_llm_prompt_sends_only_the_text():
+    def handler(request: httpx.Request):
+        assert json.loads(request.content) == {"model": "m", "messages": [{"role": "user", "content": "hi"}]}
+        return httpx.Response(200, json={"choices": [{"message": {"content": "<think>hmm</think>\nhello"}}]})
+
+    llm = LLMClient("http://llm/v1", None, 10)
+    llm._http._transport = httpx.MockTransport(handler)
+    assert await llm.prompt("hi", "m") == "hello"
 
 
 async def test_reacts_with_the_emoji_of_the_matching_rule():
@@ -983,7 +1079,7 @@ async def test_one_tldr_at_a_time_per_model():
 
     assert started == ["glm-5.3", "deepseek"]
     assert [t for _, t, _ in bot.signal.sent if "still working" in t] == [
-        "I'm still working on another summary with glm-5.3, try again once it's done."
+        "I'm still working on another request with glm-5.3, try again once it's done."
     ]
 
     release.set()
