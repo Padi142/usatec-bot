@@ -214,8 +214,8 @@ class TldrBot:
         self.cats = cats
         self.cat_gen = cat_gen
         self._tasks: set[asyncio.Task] = set()
-        # Only one summary runs at a time, across all groups.
-        self._busy = False
+        # Models with a summary running. Each runs one at a time, across all groups.
+        self._busy_models: set[str] = set()
 
     async def run(self) -> None:
         async for payload in self.signal.events():
@@ -373,30 +373,36 @@ class TldrBot:
             )
             return
 
-        # No await between the check and the assignment, so this can't race.
-        if self._busy:
-            await self.reply(msg, "I'm still working on another summary, try again once it's done.")
+        model = await self._resolve_tldr_model(msg, command)
+        if model is None:
             return
-        self._busy = True
+
+        # No await between the check and the add, so this can't race.
+        if model in self._busy_models:
+            await self.reply(msg, f"I'm still working on another summary with {model}, try again once it's done.")
+            return
+        self._busy_models.add(model)
         try:
-            await self._summarize(msg, command)
+            await self._summarize(msg, command, model)
         finally:
-            self._busy = False
+            self._busy_models.discard(model)
 
-    async def _summarize(self, msg: GroupMessage, command: TldrCommand) -> None:
-        model = self.current_model
-        if command.model is not None:
-            try:
-                found = find_model(await self.llm.available_models(), command.model)
-            except LLMError as e:
-                log.error("Model list failed: %s", e)
-                await self.reply(msg, f"I couldn't check the model {command.model} right now.")
-                return
-            if found is None:
-                await self.reply(msg, f"I don't know the model {command.model}. /model lists the available ones.")
-                return
-            model = found.slug
+    async def _resolve_tldr_model(self, msg: GroupMessage, command: TldrCommand) -> str | None:
+        """The slug this summary should use. On None, the caller has already been told why."""
+        if command.model is None:
+            return self.current_model
+        try:
+            found = find_model(await self.llm.available_models(), command.model)
+        except LLMError as e:
+            log.error("Model list failed: %s", e)
+            await self.reply(msg, f"I couldn't check the model {command.model} right now.")
+            return None
+        if found is None:
+            await self.reply(msg, f"I don't know the model {command.model}. /model lists the available ones.")
+            return None
+        return found.slug
 
+    async def _summarize(self, msg: GroupMessage, command: TldrCommand, model: str) -> None:
         max_count = self.cfg.max_count
         capped = False
         since_label: str | None = None

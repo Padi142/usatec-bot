@@ -755,6 +755,33 @@ async def test_allowed_groups_filter():
     assert bot.store.last_before(GROUP, 10_000, 10) == []
 
 
+async def test_one_tldr_at_a_time_per_model():
+    bot = make_bot()
+    release = asyncio.Event()
+    started = []
+
+    async def slow_summarize(transcript, model):
+        started.append(model)
+        await release.wait()
+        return "done"
+
+    bot.llm.summarize = slow_summarize
+    bot.handle(envelope(group_data("hello", ts=1)))
+    for ts, text in enumerate(["/tldr glm-5.3", "/tldr deepseek", "/tldr GLM-5.3"], start=10):
+        bot.handle(envelope(group_data(text, ts=ts)))
+    await asyncio.sleep(0.01)
+
+    assert started == ["glm-5.3", "deepseek"]
+    assert [t for _, t, _ in bot.signal.sent if "still working" in t] == [
+        "I'm still working on another summary with glm-5.3, try again once it's done."
+    ]
+
+    release.set()
+    for task in list(bot._tasks):
+        await task
+    assert bot._busy_models == set()
+
+
 async def test_only_one_tldr_at_a_time():
     bot = make_bot()
     release = asyncio.Event()
