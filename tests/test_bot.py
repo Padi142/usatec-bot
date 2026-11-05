@@ -8,6 +8,7 @@ import pytest
 
 from tldr_bot.bot import (
     LOCAL_TZ,
+    MAX_PENDING_REACTIONS,
     TldrBot,
     TldrCommand,
     build_transcript,
@@ -24,8 +25,19 @@ from tldr_bot.bot import (
 from tldr_bot.cats import CatClient, CatError, CatGenClient
 from tldr_bot.config import Config, normalize_group_id
 from tldr_bot.health import heartbeat, is_healthy
-from tldr_bot.llm import STATUS_URL, LLMClient, LLMError, ModelInfo
+from tldr_bot.llm import STATUS_URL, Choice, LLMClient, LLMError, ModelInfo
+from tldr_bot.reactions import (
+    DEFAULT_RULES,
+    MIN_CONFIDENCE,
+    ReactAdd,
+    ReactRemove,
+    ReactShow,
+    ReactionRule,
+    is_emoji,
+    parse_react_command,
+)
 from tldr_bot.signal_api import (
+    DirectMessage,
     GroupDelete,
     GroupEdit,
     GroupMessage,
@@ -123,6 +135,29 @@ def test_parse_model_command(text, expected):
     assert parse_model_command(text) == expected
 
 
+@pytest.mark.parametrize("text, expected", [
+    ("/react", ReactShow()),
+    ("/react add 🐈 cats and kittens", ReactAdd("🐈", "cats and kittens")),
+    ("/REACT ADD 🐈 Cats", ReactAdd("🐈", "Cats")),
+    ("/react add 🐈", ReactShow()),
+    ("/react remove 🐈", ReactRemove("🐈")),
+    ("/react model gemma4", ReactShow()),
+    ("/react nonsense", ReactShow()),
+    ("/reactx", None),
+    ("hello /react", None),
+])
+def test_parse_react_command(text, expected):
+    assert parse_react_command(text) == expected
+
+
+@pytest.mark.parametrize("text, expected", [
+    ("🐈", True), ("🛏️", True), ("👍🏽", True), ("👨‍👩‍👧", True), ("🇨🇿", True),
+    ("cat", False), ("🐈cats", False), ("", False),
+])
+def test_is_emoji(text, expected):
+    assert is_emoji(text) is expected
+
+
 def test_format_models():
     text = format_models(
         [ModelInfo("deepseek"), ModelInfo("kimi"), ModelInfo("kimi-k3", False), ModelInfo("glm-5.3", True, 2)],
@@ -164,7 +199,7 @@ def test_parse_macka_gen(text, expected):
 
 def test_parse_group_message():
     ev = parse_event(envelope(group_data("hello", ts=42)))
-    assert ev == GroupMessage(GROUP, "uuid-alice", "Alice", "+420111", 42, "hello", [])
+    assert ev == GroupMessage(GROUP, "uuid-alice", "Alice", "+420111", 42, "hello", [], "hello")
 
 
 def test_parse_sync_message():
@@ -172,8 +207,25 @@ def test_parse_sync_message():
     assert isinstance(ev, GroupMessage) and ev.text == "from my phone"
 
 
-def test_ignores_direct_messages_and_reactions():
-    assert parse_event(envelope({"timestamp": 1, "message": "dm"})) is None
+def test_parse_direct_message():
+    dm = {"timestamp": 1, "message": "/react"}
+    assert parse_event(envelope(dm)) == DirectMessage("uuid-alice", "+420111", "/react")
+
+    # On a linked account, your own private chats arrive as sync messages.
+    to_other = dm | {"destinationNumber": "+420222"}
+    assert parse_event(envelope(to_other, sync=True)) is None
+    to_self = dm | {"destinationNumber": "+420999"}
+    assert isinstance(parse_event(envelope(to_self, sync=True)), DirectMessage)
+
+
+def test_group_message_body_is_only_what_was_typed():
+    data = group_data("yes", quote={"text": "do you like cats?"}, attachments=[{}])
+    ev = parse_event(envelope(data))
+    assert "cats" in ev.text and ev.body == "yes"
+
+
+def test_ignores_empty_direct_messages_and_reactions():
+    assert parse_event(envelope({"timestamp": 1, "reaction": {"emoji": "👍"}})) is None
     assert parse_event(envelope(group_data(None, reaction={"emoji": "👍"}))) is None
     assert parse_event({"envelope": {"sourceUuid": "x", "receiptMessage": {}}}) is None
 
@@ -299,6 +351,23 @@ async def test_available_models_joins_status_and_drops_non_chat():
 
     llm._status_http._transport = httpx.MockTransport(lambda r: httpx.Response(500))
     assert ModelInfo("glm-5.3") in await llm.available_models()
+
+
+async def test_llm_choose():
+    def handler(request: httpx.Request):
+        assert request.url.path == "/v1/systemone"
+        body = json.loads(request.content)
+        assert body["model"] == "d3" and body["state"] == "hi"
+        assert body["questions"]["answer"] == {"type": "choice", "instructions": "Which?", "criteria": {"a": "A"}}
+        return httpx.Response(200, json={"answers": {"answer": {"choice": "a", "confidence": 0.9}}})
+
+    llm = LLMClient("http://llm/v1", None, 10)
+    llm._http._transport = httpx.MockTransport(handler)
+    assert await llm.choose("hi", "Which?", {"a": "A"}, "d3") == Choice("a", 0.9)
+
+    llm._http._transport = httpx.MockTransport(lambda r: httpx.Response(200, json={"answers": {}}))
+    with pytest.raises(LLMError):
+        await llm.choose("hi", "Which?", {"a": "A"}, "d3")
 
 
 async def test_llm_summarize_strips_think():
@@ -478,6 +547,14 @@ async def test_send_group_with_attachment():
 class FakeSignal:
     def __init__(self):
         self.sent = []
+        self.direct = []
+        self.reactions = []
+
+    async def send_direct(self, recipient, text):
+        self.direct.append((recipient, text))
+
+    async def send_reaction(self, group_id, emoji, target_author, timestamp):
+        self.reactions.append((group_id, emoji, target_author, timestamp))
 
     async def send_group(self, group_id, text, **kwargs):
         self.sent.append((group_id, text, kwargs))
@@ -509,6 +586,14 @@ class FakeLLM:
     def __init__(self):
         self.transcripts = []
         self.models = []
+        self.decisions = []
+        self.reaction_choice = Choice("none", 0.99)
+
+    async def choose(self, state, instructions, criteria, model):
+        self.decisions.append((state, criteria, model))
+        if isinstance(self.reaction_choice, Exception):
+            raise self.reaction_choice
+        return self.reaction_choice
 
     async def available_models(self):
         return [ModelInfo("deepseek"), ModelInfo("glm-5.3", True), ModelInfo("kimi-k3", False)]
@@ -563,6 +648,131 @@ async def test_model_command_changes_default_and_tldr_can_override():
     assert bot.current_model == "m"
     # Commands aren't chat, so they must not end up in summaries.
     assert [m.text for m in bot.store.last_before(GROUP, 100, 100)] == ["hello"]
+
+
+async def finish_tasks(bot):
+    while bot._tasks:
+        await asyncio.gather(*bot._tasks)
+
+
+async def test_reacts_with_the_emoji_of_the_matching_rule():
+    bot = make_bot()
+    bot.llm.reaction_choice = Choice("🍺", 0.9)
+    bot.handle(envelope(group_data("jdeme na pivo?", ts=5)))
+    await finish_tasks(bot)
+
+    assert bot.signal.reactions == [(GROUP, "🍺", "+420111", 5)]
+    assert bot.signal.sent == []
+    state, criteria, model = bot.llm.decisions[0]
+    assert state == "jdeme na pivo?" and model == "vllm-sr-d3-flash"
+    assert criteria["🍺"] == "beer" and "none" in criteria
+
+
+@pytest.mark.parametrize("choice", [
+    Choice("none", 0.99), Choice("🍺", MIN_CONFIDENCE - 0.01), Choice("🦄", 0.99), LLMError("down"),
+])
+async def test_no_reaction_without_a_confident_match_or_on_failure(choice):
+    bot = make_bot()
+    bot.llm.reaction_choice = choice
+    bot.handle(envelope(group_data("hello", ts=5)))
+    await finish_tasks(bot)
+    assert bot.signal.reactions == [] and bot.signal.sent == []
+
+
+async def test_only_new_typed_text_is_judged():
+    bot = make_bot()
+    bot.handle(envelope(group_data("yes", ts=1, quote={"text": "cats?"})))
+    bot.handle(envelope(group_data(None, ts=2, sticker={"packId": "x"})))
+    bot.handle(envelope(group_data("/tldr 0", ts=3)))
+    bot.handle(envelope(group_data("/react", ts=4)))
+    await finish_tasks(bot)
+    assert [state for state, _, _ in bot.llm.decisions] == ["yes"]
+
+
+async def test_reactions_run_one_at_a_time_and_overflow_is_dropped():
+    bot = make_bot()
+    release = asyncio.Event()
+    running = 0
+    peak = 0
+
+    async def slow_choose(*args):
+        nonlocal running, peak
+        running += 1
+        peak = max(peak, running)
+        await release.wait()
+        running -= 1
+        return Choice("none", 0.99)
+
+    bot.llm.choose = slow_choose
+    for ts in range(1, MAX_PENDING_REACTIONS + 6):
+        bot.handle(envelope(group_data("hello", ts=ts)))
+    assert bot._pending_reactions == MAX_PENDING_REACTIONS
+
+    await asyncio.sleep(0)
+    release.set()
+    await finish_tasks(bot)
+    assert peak == 1 and bot._pending_reactions == 0
+
+
+async def test_react_commands_edit_rules_that_survive_a_restart():
+    bot = make_bot()
+    assert "🐈 cats" in await send_command(bot, "/react", 1)
+    assert "isn't an emoji" in await send_command(bot, "/react add dog dogs", 2)
+
+    assert await send_command(bot, "/react add 🐕 dogs", 3) == "🐕 now reacts to: dogs"
+    await send_command(bot, "/react add 🐈 only tigers", 4)
+    # Keyboards may or may not add the variation selector.
+    assert "Removed" in await send_command(bot, "/react remove 🛏", 5)
+    assert "no rule" in await send_command(bot, "/react remove 🦄", 6)
+    assert bot.reaction_rules == (
+        ReactionRule("🐈", "only tigers"), *DEFAULT_RULES[1:4], ReactionRule("🐕", "dogs"),
+    )
+
+    restarted = TldrBot(bot.cfg, bot.store, FakeSignal(), FakeLLM(), FakeCats(), FakeCatGen())
+    assert restarted.reaction_rules == bot.reaction_rules
+
+
+async def test_removing_every_rule_stops_llm_calls_and_stays_empty():
+    bot = make_bot()
+    for ts, rule in enumerate(DEFAULT_RULES, start=1):
+        await send_command(bot, f"/react remove {rule.emoji}", ts)
+    assert bot.reaction_rules == ()
+    assert "No rules" in await send_command(bot, "/react", 10)
+
+    bot.handle(envelope(group_data("cats", ts=11)))
+    await finish_tasks(bot)
+    assert bot.llm.decisions == []
+
+
+async def test_direct_react_only_works_for_people_from_the_groups():
+    bot = make_bot()
+    dm = {"timestamp": 2, "message": "/react add 🐕 dogs"}
+
+    bot.handle(envelope(dm))  # a stranger, as nobody has written in a group yet
+    await finish_tasks(bot)
+    assert bot.signal.direct == [] and bot.reaction_rules == DEFAULT_RULES
+
+    bot.handle(envelope(group_data("hello", ts=1)))
+    bot.handle(envelope(dm))
+    bot.handle(envelope({"timestamp": 3, "message": "/tldr"}))  # only /react works here
+    bot.handle(envelope({"timestamp": 4, "message": "just chatting"}))
+    await finish_tasks(bot)
+    assert bot.signal.direct == [("+420111", "🐕 now reacts to: dogs")]
+    assert bot.signal.sent == []
+    assert [m.text for m in bot.store.last_before(GROUP, 100, 100)] == ["hello"]
+
+
+async def test_send_reaction_request():
+    def handler(request: httpx.Request):
+        assert request.url.path == "/v1/reactions/+420999"
+        assert json.loads(request.content) == {
+            "reaction": "🍺", "recipient": to_rest_group_id(GROUP), "target_author": "+420111", "timestamp": 5,
+        }
+        return httpx.Response(204)
+
+    signal = SignalClient("http://signal", "+420999")
+    signal._http._transport = httpx.MockTransport(handler)
+    await signal.send_reaction(GROUP, "🍺", "+420111", 5)
 
 
 async def test_tldr_end_to_end():

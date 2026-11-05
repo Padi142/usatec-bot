@@ -25,6 +25,21 @@ more, only the newest ones are used.
 `/model <slug>` changes the model for everyone and survives restarts; `/model default`
 goes back to `LLM_MODEL`.
 
+The bot also reacts to group messages by topic: 🐈 cats, 🐦 birds, 🍺 beer, 🚲 bicycles
+and 🛏️ sleep. Most messages get no reaction. A decision model (`REACTION_MODEL`, by default
+[`vllm-sr-d3-flash`](https://huggingface.co/vllm-sr/d3-flash)) decides this for every message,
+so reactions have a small token cost.
+
+The rules can be changed in a group, or in a direct message to the bot:
+
+- `/react` — show the rules,
+- `/react add <emoji> <topic>` — add a rule, or change the topic of that emoji,
+- `/react remove <emoji>` — remove a rule (with no rules left, the bot stops calling the model).
+
+Rules apply to all groups and survive restarts. Direct messages only accept `/react`, and only
+from someone who has already written in one of the bot's groups; everyone else is ignored. If the
+bot is linked to your own account, use Note to Self for this.
+
 `/macka` replies with a random cat picture from [kocicividea.cz](https://kocicividea.cz/).
 
 `/mackagen` generates a new cat with [nano-catana](https://research.kocicividea.cz/), using
@@ -44,8 +59,9 @@ summarizes from there. As a result:
 - deleted messages are removed from the database, and edited ones are updated,
 - only the newest `HISTORY_LIMIT` messages per group are kept (default 5000).
 
-It's a good idea to tell the group that a bot is storing their messages
-and sending them to e-INFRA CZ for summarization. See e-INFRA's
+It's a good idea to tell the group that a bot is storing their messages and
+sending them to e-INFRA CZ: for summarization when someone asks, and each new
+message as it arrives to pick a reaction. See e-INFRA's
 [data privacy notes](https://docs.cerit-sc.cz/en/docs/ai-as-a-service/ai-data-privacy).
 
 ```

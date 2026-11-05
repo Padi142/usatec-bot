@@ -32,6 +32,15 @@ class GroupMessage:
     timestamp: int
     text: str
     mentions: list[Mention] = field(default_factory=list)
+    # What the sender typed, without the quote and attachment markers `text` has.
+    body: str | None = None
+
+
+@dataclass(frozen=True)
+class DirectMessage:
+    sender_id: str
+    sender_number: str | None
+    text: str
 
 
 @dataclass(frozen=True)
@@ -50,7 +59,7 @@ class GroupDelete:
     target_timestamp: int
 
 
-Event = GroupMessage | GroupEdit | GroupDelete
+Event = GroupMessage | GroupEdit | GroupDelete | DirectMessage
 
 
 def to_rest_group_id(internal_id: str) -> str:
@@ -91,8 +100,12 @@ def _mentions(data: dict) -> list[Mention]:
     ]
 
 
+def _is_note_to_self(sent: dict, account: str | None) -> bool:
+    return account is not None and account in (sent.get("destinationNumber"), sent.get("destination"))
+
+
 def parse_event(payload: dict) -> Event | None:
-    """Turn a raw websocket payload into a group event we care about, or None."""
+    """Turn a raw websocket payload into an event we care about, or None."""
     env = payload.get("envelope")
     if not env:
         return None
@@ -112,7 +125,8 @@ def parse_event(payload: dict) -> Event | None:
         return None
 
     data = env.get("dataMessage")
-    if data is None:
+    is_sync = data is None
+    if is_sync:
         # Messages sent from the account's primary device show up as sync messages
         # when the bot runs as a linked device.
         data = (env.get("syncMessage") or {}).get("sentMessage")
@@ -121,7 +135,12 @@ def parse_event(payload: dict) -> Event | None:
 
     group_id = (data.get("groupInfo") or {}).get("groupId")
     if not group_id:
-        return None  # direct message
+        # On a linked account, synced direct messages are private chats with other
+        # people. Only Note to Self is addressed to the bot.
+        text = data.get("message")
+        if not text or (is_sync and not _is_note_to_self(data, payload.get("account"))):
+            return None
+        return DirectMessage(sender_id, sender_number, text)
 
     if delete := data.get("remoteDelete"):
         return GroupDelete(group_id, sender_id, delete["timestamp"])
@@ -130,7 +149,9 @@ def parse_event(payload: dict) -> Event | None:
     if text is None:
         return None
     timestamp = data.get("timestamp") or env.get("timestamp")
-    return GroupMessage(group_id, sender_id, sender_name, sender_number, timestamp, text, _mentions(data))
+    return GroupMessage(
+        group_id, sender_id, sender_name, sender_number, timestamp, text, _mentions(data), data.get("message"),
+    )
 
 
 def render_mentions(text: str, mentions: list[Mention], name_for) -> str:
@@ -204,6 +225,26 @@ class SignalClient:
                 "quote_message": quote_text or "",
             }
         resp = await self._http.post("/v2/send", json=body)
+        resp.raise_for_status()
+
+    async def send_direct(self, recipient: str, text: str) -> None:
+        """Send a direct message to a phone number or UUID."""
+        resp = await self._http.post(
+            "/v2/send", json={"number": self.number, "recipients": [recipient], "message": text},
+        )
+        resp.raise_for_status()
+
+    async def send_reaction(self, group_id: str, emoji: str, target_author: str, timestamp: int) -> None:
+        """React to the group message that target_author sent at timestamp."""
+        resp = await self._http.post(
+            f"/v1/reactions/{self.number}",
+            json={
+                "reaction": emoji,
+                "recipient": to_rest_group_id(group_id),
+                "target_author": target_author,
+                "timestamp": timestamp,
+            },
+        )
         resp.raise_for_status()
 
     async def set_typing(self, group_id: str, typing: bool) -> None:

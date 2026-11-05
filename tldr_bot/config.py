@@ -71,6 +71,8 @@ class Config:
     allowed_groups: frozenset[str]
 
     cat_gen_api_key: str | None = None
+    # Judges every group message. This has to be a decision model, not a chat model.
+    reaction_model: str = "vllm-sr-d3-flash"
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -91,4 +93,5 @@ class Config:
                 normalize_group_id(g) for g in allowed.split(",") if g.strip()
             ),
             cat_gen_api_key=os.environ.get("CAT_GEN_API_KEY") or None,
+            reaction_model=os.environ.get("REACTION_MODEL") or cls.reaction_model,
         )

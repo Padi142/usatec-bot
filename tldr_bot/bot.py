@@ -9,7 +9,35 @@ from zoneinfo import ZoneInfo
 from .cats import GRID_LAYOUTS, CatClient, CatError, CatGenClient
 from .config import Config
 from .llm import LLMClient, LLMError, ModelInfo
-from .signal_api import GroupDelete, GroupEdit, GroupMessage, SignalClient, parse_event, render_mentions
+from .reactions import (
+    INSTRUCTIONS,
+    MAX_MESSAGE_CHARS,
+    MAX_RULES,
+    MAX_TOPIC_CHARS,
+    ReactAdd,
+    ReactCommand,
+    ReactRemove,
+    ReactShow,
+    ReactionRule,
+    build_criteria,
+    dump_rules,
+    is_emoji,
+    load_rules,
+    parse_react_command,
+    pick_rule,
+    same_emoji,
+    with_rule,
+    without_rule,
+)
+from .signal_api import (
+    DirectMessage,
+    GroupDelete,
+    GroupEdit,
+    GroupMessage,
+    SignalClient,
+    parse_event,
+    render_mentions,
+)
 from .store import ChatMessage, MessageStore
 
 log = logging.getLogger(__name__)
@@ -25,6 +53,17 @@ TIME_RE = re.compile(r"^(\d{1,2}):(\d{2})$")
 
 # Settings key for the model chosen with /model.
 MODEL_SETTING = "llm_model"
+REACTION_RULES_SETTING = "reaction_rules"
+
+# The API key allows 4 parallel requests and summaries need them, so reactions run
+# one at a time. Past this many waiting, for example during an outage, new messages
+# get no reaction rather than a late one.
+MAX_PENDING_REACTIONS = 20
+
+REACT_USAGE = (
+    "/react add <emoji> <topic> adds a rule or changes its topic.\n"
+    "/react remove <emoji> removes a rule."
+)
 
 
 @dataclass(frozen=True)
@@ -216,6 +255,8 @@ class TldrBot:
         self._tasks: set[asyncio.Task] = set()
         # Models with a summary running. Each runs one at a time, across all groups.
         self._busy_models: set[str] = set()
+        self._reaction_slot = asyncio.Semaphore(1)
+        self._pending_reactions = 0
 
     async def run(self) -> None:
         async for payload in self.signal.events():
@@ -227,6 +268,9 @@ class TldrBot:
     def handle(self, payload: dict) -> None:
         event = parse_event(payload)
         if event is None:
+            return
+        if isinstance(event, DirectMessage):
+            self._handle_direct(event)
             return
         if self.cfg.allowed_groups and event.group_id not in self.cfg.allowed_groups:
             log.debug("Ignoring message from non-allowed group %s", event.group_id)
@@ -247,6 +291,9 @@ class TldrBot:
             case GroupMessage() if (model_command := parse_model_command(event.text)) is not None:
                 log.info("/model from %s in group %s", event.sender_name, event.group_id)
                 self._spawn(self.run_model(event, model_command))
+            case GroupMessage() if (react_command := parse_react_command(event.text)) is not None:
+                log.info("/react from %s in group %s", event.sender_name, event.group_id)
+                self._spawn(self.run_react_command(event, react_command))
             case GroupMessage():
                 command = parse_command(event.text)
                 if command is None:
@@ -254,9 +301,25 @@ class TldrBot:
                     self.store.add(
                         ChatMessage(event.group_id, event.sender_id, event.sender_name, event.timestamp, text)
                     )
+                    self._queue_reaction(event)
                 else:
                     log.info("/tldr from %s in group %s", event.sender_name, event.group_id)
                     self._spawn(self.run_tldr(event, command))
+
+    def _handle_direct(self, msg: DirectMessage) -> None:
+        """Direct messages only do /react, for people the bot knows from its groups.
+
+        Anyone can message the bot's number, but rules are fed to the LLM on every
+        group message, so strangers get no way in and no reply.
+        """
+        command = parse_react_command(msg.text)
+        if command is None:
+            return
+        if self.store.display_name(msg.sender_id) is None:
+            log.info("Ignoring direct /react from unknown sender %s", msg.sender_id)
+            return
+        log.info("/react in a direct message from %s", msg.sender_id)
+        self._spawn(self.run_react_command(msg, command))
 
     def _spawn(self, coro) -> None:
         task = asyncio.create_task(coro)
@@ -311,6 +374,80 @@ class TldrBot:
             await self.reply(msg, "🐈", attachments=[cat])
         except Exception:
             log.exception("/mackagen failed")
+
+    @property
+    def reaction_rules(self) -> tuple[ReactionRule, ...]:
+        return load_rules(self.store.setting(REACTION_RULES_SETTING))
+
+    def _queue_reaction(self, msg: GroupMessage) -> None:
+        # Stickers and bare attachments have no text to judge.
+        if not msg.body or not self.reaction_rules:
+            return
+        if self._pending_reactions >= MAX_PENDING_REACTIONS:
+            log.warning("Too many pending reactions, skipping a message")
+            return
+        self._pending_reactions += 1
+        self._spawn(self.run_reaction(msg))
+
+    async def run_reaction(self, msg: GroupMessage) -> None:
+        try:
+            async with self._reaction_slot:
+                await self._react(msg)
+        except Exception:
+            log.exception("Reaction failed")
+        finally:
+            self._pending_reactions -= 1
+
+    async def _react(self, msg: GroupMessage) -> None:
+        """React if the message matches a rule. A failure only costs the reaction, the chat sees nothing."""
+        rules = self.reaction_rules
+        text = render_mentions(msg.body or "", msg.mentions, self.store.display_name)
+        try:
+            choice = await self.llm.choose(
+                text[:MAX_MESSAGE_CHARS], INSTRUCTIONS, build_criteria(rules), self.cfg.reaction_model,
+            )
+        except LLMError as e:
+            log.warning("Reaction decision failed: %s", e)
+            return
+        rule = pick_rule(choice, rules)
+        if rule is not None:
+            await self.signal.send_reaction(
+                msg.group_id, rule.emoji, msg.sender_number or msg.sender_id, msg.timestamp,
+            )
+
+    async def run_react_command(self, msg: GroupMessage | DirectMessage, command: ReactCommand) -> None:
+        try:
+            text = self._react_command_reply(command)
+            match msg:
+                case GroupMessage():
+                    await self.reply(msg, text)
+                case DirectMessage():
+                    await self.signal.send_direct(msg.sender_number or msg.sender_id, text)
+        except Exception:
+            log.exception("/react failed")
+
+    def _react_command_reply(self, command: ReactCommand) -> str:
+        """Carry out a /react command and return what to tell the sender."""
+        rules = self.reaction_rules
+        match command:
+            case ReactShow():
+                listing = "\n".join(f"{r.emoji} {r.topic}" for r in rules) or "No rules, so I don't react to anything."
+                return f"Reaction rules:\n{listing}\n\n{REACT_USAGE}"
+            case ReactAdd(emoji=emoji, topic=topic):
+                if not is_emoji(emoji):
+                    return f"{emoji} isn't an emoji.\n\n{REACT_USAGE}"
+                if len(topic) > MAX_TOPIC_CHARS:
+                    return f"That topic is too long, the limit is {MAX_TOPIC_CHARS} characters."
+                updated = with_rule(rules, ReactionRule(emoji, topic))
+                if len(updated) > MAX_RULES:
+                    return f"That's too many rules, the limit is {MAX_RULES}."
+                self.store.set_setting(REACTION_RULES_SETTING, dump_rules(updated))
+                return f"{emoji} now reacts to: {topic}"
+            case ReactRemove(emoji=emoji):
+                if not any(same_emoji(r.emoji, emoji) for r in rules):
+                    return f"There's no rule for {emoji}."
+                self.store.set_setting(REACTION_RULES_SETTING, dump_rules(without_rule(rules, emoji)))
+                return f"Removed the rule for {emoji}."
 
     @property
     def current_model(self) -> str:
