@@ -39,7 +39,7 @@ STATUS_URL = "https://llm.ai.e-infra.cz/status/api/v1/models"
 # Model lookups shouldn't wait as long as a summary might.
 LOOKUP_TIMEOUT = 15.0
 # /v1/models also lists entries that can't chat, which would only fail in /tldr.
-_NON_CHAT_RE = re.compile(r"embed|rerank|whisper|canary|-e5-|all-proxy-models", re.IGNORECASE)
+_NON_CHAT_RE = re.compile(r"embed|rerank|whisper|canary|-e5-|all-proxy-models|vllm-sr-", re.IGNORECASE)
 
 
 @dataclass(frozen=True)

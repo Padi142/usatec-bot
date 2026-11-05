@@ -280,7 +280,7 @@ def test_build_transcript_uses_prague_time():
 async def test_available_models_joins_status_and_drops_non_chat():
     llm = LLMClient("http://llm/v1", "sk-test", 10)
     llm._http._transport = httpx.MockTransport(lambda r: httpx.Response(200, json={"data": [
-        {"id": "deepseek"}, {"id": "glm-5.3"}, {"id": "kimi-k3"}, {"id": "qwen3-embedding-4b"}, {"id": "all-proxy-models"},
+        {"id": "deepseek"}, {"id": "glm-5.3"}, {"id": "kimi-k3"}, {"id": "qwen3-embedding-4b"}, {"id": "all-proxy-models"}, {"id": "vllm-sr-d3-flash"},
     ]}))
 
     def status(request: httpx.Request):
