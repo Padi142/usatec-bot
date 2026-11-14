@@ -38,6 +38,7 @@ from .signal_api import (
     parse_event,
     render_mentions,
 )
+from .stickers import StickerEmojis, StickerError
 from .store import ChatMessage, MessageStore
 
 log = logging.getLogger(__name__)
@@ -258,6 +259,7 @@ class TldrBot:
         llm: LLMClient,
         cats: CatClient,
         cat_gen: CatGenClient | None = None,
+        stickers: StickerEmojis | None = None,  # None means stickers get no reactions
     ):
         self.cfg = cfg
         self.store = store
@@ -265,6 +267,7 @@ class TldrBot:
         self.llm = llm
         self.cats = cats
         self.cat_gen = cat_gen
+        self.stickers = stickers
         self._tasks: set[asyncio.Task] = set()
         # Models with a summary running. Each runs one at a time, across all groups.
         self._busy_models: set[str] = set()
@@ -399,8 +402,9 @@ class TldrBot:
         return load_rules(self.store.setting(REACTION_RULES_SETTING))
 
     def _queue_reaction(self, msg: GroupMessage) -> None:
-        # Stickers and bare attachments have no text to judge.
-        if not msg.body or not self.reaction_rules:
+        # Bare attachments have nothing to judge.
+        judgeable = bool(msg.body) or (msg.sticker is not None and self.stickers is not None)
+        if not judgeable or not self.reaction_rules:
             return
         if self._pending_reactions >= MAX_PENDING_REACTIONS:
             log.warning("Too many pending reactions, skipping a message")
@@ -420,11 +424,11 @@ class TldrBot:
     async def _react(self, msg: GroupMessage) -> None:
         """React if the message matches a rule. A failure only costs the reaction, the chat sees nothing."""
         rules = self.reaction_rules
-        text = render_mentions(msg.body or "", msg.mentions, self.store.display_name)
+        state = await self._judged_content(msg)
+        if not state:
+            return
         try:
-            choice = await self.llm.choose(
-                text[:MAX_MESSAGE_CHARS], INSTRUCTIONS, build_criteria(rules), self.cfg.reaction_model,
-            )
+            choice = await self.llm.choose(state, INSTRUCTIONS, build_criteria(rules), self.cfg.reaction_model)
         except LLMError as e:
             log.warning("Reaction decision failed: %s", e)
             return
@@ -433,6 +437,18 @@ class TldrBot:
             await self.signal.send_reaction(
                 msg.group_id, rule.emoji, msg.sender_number or msg.sender_id, msg.timestamp,
             )
+
+    async def _judged_content(self, msg: GroupMessage) -> str | None:
+        """What the decision model sees: the typed text, or a sticker's emoji on its own."""
+        if msg.body:
+            return render_mentions(msg.body, msg.mentions, self.store.display_name)[:MAX_MESSAGE_CHARS]
+        if msg.sticker is None or self.stickers is None:
+            return None
+        try:
+            return await self.stickers.emoji(msg.sticker)
+        except StickerError as e:
+            log.warning("Sticker lookup failed: %s", e)
+            return None
 
     async def run_react_command(self, msg: GroupMessage | DirectMessage, command: ReactCommand) -> None:
         try:

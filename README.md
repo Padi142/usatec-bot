@@ -36,6 +36,10 @@ The rules can be changed in a group, or in a direct message to the bot:
 - `/react add <emoji> <topic>` — add a rule, or change the topic of that emoji,
 - `/react remove <emoji>` — remove a rule (with no rules left, the bot stops calling the model).
 
+Stickers get reactions too, judged by the emoji their pack gives them: a 😴 sticker gets 🛏️.
+The bot downloads each sticker pack's manifest from Signal's CDN once, to read those emojis,
+because signal-cli doesn't pass them on.
+
 Rules apply to all groups and survive restarts. Direct messages only accept `/react`, and only
 from someone who has already written in one of the bot's groups; everyone else is ignored. If the
 bot is linked to your own account, use Note to Self for this.

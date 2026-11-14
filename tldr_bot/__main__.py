@@ -8,6 +8,7 @@ from .config import Config
 from .health import heartbeat
 from .llm import LLMClient
 from .signal_api import SignalClient
+from .stickers import StickerEmojis
 from .store import MessageStore
 
 
@@ -18,14 +19,16 @@ async def main() -> None:
     llm = LLMClient(cfg.llm_base_url, cfg.llm_api_key, cfg.llm_timeout)
     cats = CatClient()
     cat_gen = CatGenClient(cfg.cat_gen_api_key) if cfg.cat_gen_api_key else None
+    stickers = StickerEmojis(signal)
     health = asyncio.create_task(heartbeat(signal))
     try:
-        await TldrBot(cfg, store, signal, llm, cats, cat_gen).run()
+        await TldrBot(cfg, store, signal, llm, cats, cat_gen, stickers).run()
     finally:
         health.cancel()
         await signal.close()
         await llm.close()
         await cats.close()
+        await stickers.close()
         if cat_gen:
             await cat_gen.close()
         store.close()

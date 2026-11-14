@@ -5,6 +5,7 @@ import base64
 import json
 import logging
 from collections.abc import AsyncIterator
+from urllib.parse import parse_qs, urlsplit
 from dataclasses import dataclass, field
 
 import httpx
@@ -24,6 +25,12 @@ class Mention:
 
 
 @dataclass(frozen=True)
+class Sticker:
+    pack_id: str  # hex, as signal-cli and the sticker CDN write it
+    sticker_id: int
+
+
+@dataclass(frozen=True)
 class GroupMessage:
     group_id: str
     sender_id: str
@@ -34,6 +41,7 @@ class GroupMessage:
     mentions: list[Mention] = field(default_factory=list)
     # What the sender typed, without the quote and attachment markers `text` has.
     body: str | None = None
+    sticker: Sticker | None = None
 
 
 @dataclass(frozen=True)
@@ -86,6 +94,14 @@ def _describe(data: dict) -> str | None:
             snippet = snippet[:77] + "..."
         text = f'(replying to "{snippet}") {text}'
     return text
+
+
+def _sticker(data: dict) -> Sticker | None:
+    sticker = data.get("sticker") or {}
+    pack_id, sticker_id = sticker.get("packId"), sticker.get("stickerId")
+    if isinstance(pack_id, str) and isinstance(sticker_id, int):
+        return Sticker(pack_id.lower(), sticker_id)
+    return None
 
 
 def _mentions(data: dict) -> list[Mention]:
@@ -151,6 +167,7 @@ def parse_event(payload: dict) -> Event | None:
     timestamp = data.get("timestamp") or env.get("timestamp")
     return GroupMessage(
         group_id, sender_id, sender_name, sender_number, timestamp, text, _mentions(data), data.get("message"),
+        _sticker(data),
     )
 
 
@@ -246,6 +263,17 @@ class SignalClient:
             },
         )
         resp.raise_for_status()
+
+    async def sticker_pack_key(self, pack_id: str) -> str | None:
+        """The hex key of a sticker pack the account has seen, or None if it hasn't."""
+        resp = await self._http.get(f"/v1/sticker-packs/{self.number}")
+        resp.raise_for_status()
+        for pack in resp.json():
+            if str(pack.get("pack_id", "")).lower() == pack_id:
+                # The pack's share link: https://signal.art/addstickers/#pack_id=...&pack_key=...
+                keys = parse_qs(urlsplit(str(pack.get("url", ""))).fragment).get("pack_key")
+                return keys[0] if keys else None
+        return None
 
     async def set_typing(self, group_id: str, typing: bool) -> None:
         """Best-effort typing indicator; failures are only logged."""

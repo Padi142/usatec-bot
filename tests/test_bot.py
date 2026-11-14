@@ -2,6 +2,7 @@ import asyncio
 import json
 import os
 from datetime import datetime, timedelta
+from pathlib import Path
 
 import httpx
 import pytest
@@ -38,8 +39,11 @@ from tldr_bot.reactions import (
     is_emoji,
     parse_react_command,
 )
+from tldr_bot.stickers import StickerEmojis, StickerError, decrypt_manifest, parse_emojis
+from tldr_bot import stickers as stickers_module
 from tldr_bot.signal_api import (
     DirectMessage,
+    Sticker,
     GroupDelete,
     GroupEdit,
     GroupMessage,
@@ -236,6 +240,11 @@ def test_group_message_body_is_only_what_was_typed():
     data = group_data("yes", quote={"text": "do you like cats?"}, attachments=[{}])
     ev = parse_event(envelope(data))
     assert "cats" in ev.text and ev.body == "yes"
+
+
+def test_parse_sticker():
+    ev = parse_event(envelope(group_data(None, sticker={"packId": "9ACC", "stickerId": 4})))
+    assert ev.text == "[sticker]" and ev.body is None and ev.sticker == Sticker("9acc", 4)
 
 
 def test_ignores_empty_direct_messages_and_reactions():
@@ -869,6 +878,100 @@ async def test_send_reaction_request():
     signal = SignalClient("http://signal", "+420999")
     signal._http._transport = httpx.MockTransport(handler)
     await signal.send_reaction(GROUP, "🍺", "+420111", 5)
+
+
+# Signal's own "Bandit the Cat" pack, as served by cdn.signal.org, and its public key.
+BANDIT_PACK_ID = "9acc9e8aba563d26a4994e69263e3b25"
+BANDIT_PACK_KEY = "5a6dff3948c28efb9b7aaf93ecc375c69fc316e78077ed26867a14d10a0f6a12"
+BANDIT_MANIFEST = (Path(__file__).parent / "fixtures" / "bandit-the-cat-manifest.bin").read_bytes()
+
+
+def test_decrypt_real_sticker_manifest():
+    emojis = parse_emojis(decrypt_manifest(BANDIT_MANIFEST, bytes.fromhex(BANDIT_PACK_KEY)))
+    assert emojis[0] == "👍" and emojis[4] == "😴" and emojis[16] == "😸"
+
+
+def test_tampered_sticker_manifest_is_rejected():
+    tampered = bytearray(BANDIT_MANIFEST)
+    tampered[20] ^= 1
+    with pytest.raises(StickerError, match="integrity"):
+        decrypt_manifest(bytes(tampered), bytes.fromhex(BANDIT_PACK_KEY))
+    with pytest.raises(StickerError):
+        decrypt_manifest(BANDIT_MANIFEST, bytes(32))
+
+
+async def test_sticker_pack_key_from_the_rest_api():
+    url = f"https://signal.art/addstickers/#pack_id={BANDIT_PACK_ID}&pack_key={BANDIT_PACK_KEY}"
+
+    def handler(request: httpx.Request):
+        assert request.url.path == "/v1/sticker-packs/+420999"
+        return httpx.Response(200, json=[{"pack_id": "other", "url": ""}, {"pack_id": BANDIT_PACK_ID, "url": url}])
+
+    signal = SignalClient("http://signal", "+420999")
+    signal._http._transport = httpx.MockTransport(handler)
+    assert await signal.sticker_pack_key(BANDIT_PACK_ID) == BANDIT_PACK_KEY
+    assert await signal.sticker_pack_key("unknown") is None
+
+
+class FakePackKeys:
+    """The REST API's view of sticker packs: the key shows up after `missing_for` lookups."""
+
+    def __init__(self, missing_for=0):
+        self.lookups = 0
+        self.missing_for = missing_for
+
+    async def sticker_pack_key(self, pack_id):
+        self.lookups += 1
+        return BANDIT_PACK_KEY if self.lookups > self.missing_for else None
+
+
+async def test_sticker_emojis_download_each_pack_once(monkeypatch):
+    monkeypatch.setattr(stickers_module, "PACK_KEY_RETRY_DELAY", 0)
+    downloads = []
+
+    def cdn(request: httpx.Request):
+        downloads.append(request.url.path)
+        return httpx.Response(200, content=BANDIT_MANIFEST)
+
+    keys = FakePackKeys(missing_for=1)  # as if signal-cli was still saving the key
+    lookup = StickerEmojis(keys)
+    lookup._cdn._transport = httpx.MockTransport(cdn)
+    assert await lookup.emoji(Sticker(BANDIT_PACK_ID, 4)) == "😴"
+    assert await lookup.emoji(Sticker(BANDIT_PACK_ID, 16)) == "😸"
+    assert await lookup.emoji(Sticker(BANDIT_PACK_ID, 999)) is None
+    assert downloads == [f"/stickers/{BANDIT_PACK_ID}/manifest.proto"]
+
+    with pytest.raises(StickerError, match="doesn't know the key"):
+        await StickerEmojis(FakePackKeys(missing_for=2)).emoji(Sticker("0000", 1))
+
+
+class FakeStickers:
+    def __init__(self, emoji="😴"):
+        self.result = emoji
+
+    async def emoji(self, sticker):
+        if isinstance(self.result, Exception):
+            raise self.result
+        return self.result
+
+
+async def test_stickers_are_judged_by_their_emoji():
+    bot = make_bot()
+    bot.stickers = FakeStickers("😴")
+    bot.llm.reaction_choice = Choice("🛏️", 0.9)
+    bot.handle(envelope(group_data(None, ts=5, sticker={"packId": BANDIT_PACK_ID, "stickerId": 4})))
+    await finish_tasks(bot)
+    assert [state for state, _, _ in bot.llm.decisions] == ["😴"]
+    assert bot.signal.reactions == [(GROUP, "🛏️", "+420111", 5)]
+
+
+@pytest.mark.parametrize("emoji", [None, StickerError("CDN down")])
+async def test_sticker_without_an_emoji_gets_no_reaction(emoji):
+    bot = make_bot()
+    bot.stickers = FakeStickers(emoji)
+    bot.handle(envelope(group_data(None, ts=5, sticker={"packId": BANDIT_PACK_ID, "stickerId": 4})))
+    await finish_tasks(bot)
+    assert bot.llm.decisions == [] and bot.signal.reactions == []
 
 
 async def test_tldr_end_to_end():
