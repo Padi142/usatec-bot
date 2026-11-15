@@ -6,7 +6,7 @@ from dataclasses import asdict, dataclass
 
 from .llm import Choice
 
-MAX_RULES = 20
+MAX_RULES = 67
 MAX_TOPIC_CHARS = 200
 # Only the start of a long message is judged, which is plenty to find its topic.
 MAX_MESSAGE_CHARS = 2000
