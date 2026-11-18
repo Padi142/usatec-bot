@@ -58,11 +58,26 @@ def same_emoji(a: str, b: str) -> bool:
     return a.replace(_VARIATION_SELECTOR, "") == b.replace(_VARIATION_SELECTOR, "")
 
 
+def _topic_parts(topic: str) -> list[str]:
+    return [part.strip() for part in topic.split(",") if part.strip()]
+
+
+def merge_topics(old: str, new: str) -> str:
+    """Words added to a topic that already exists. Parts it already has change nothing."""
+    have = {part.lower() for part in _topic_parts(old)}
+    added = [part for part in _topic_parts(new) if part.lower() not in have]
+    return ", ".join(_topic_parts(old) + added) if added else old
+
+
 def with_rule(rules: tuple[ReactionRule, ...], rule: ReactionRule) -> tuple[ReactionRule, ...]:
-    """Add a rule, or replace the topic in place if the emoji already has one."""
-    if any(same_emoji(r.emoji, rule.emoji) for r in rules):
-        return tuple(rule if same_emoji(r.emoji, rule.emoji) else r for r in rules)
-    return (*rules, rule)
+    """Add a rule. For an emoji that already has one, the new words join its topic."""
+    if not any(same_emoji(r.emoji, rule.emoji) for r in rules):
+        return (*rules, rule)
+    # The stored emoji stays as it is, so the rules and the model's labels keep matching it.
+    return tuple(
+        ReactionRule(r.emoji, merge_topics(r.topic, rule.topic)) if same_emoji(r.emoji, rule.emoji) else r
+        for r in rules
+    )
 
 
 def without_rule(rules: tuple[ReactionRule, ...], emoji: str) -> tuple[ReactionRule, ...]:
@@ -105,7 +120,7 @@ def parse_react_command(text: str) -> ReactCommand | None:
 
     Recognized forms:
       /react                       the rules and this usage
-      /react add <emoji> <topic>   add a rule, or change the topic of that emoji
+      /react add <emoji> <topic>   add a rule, or add words to the topic of that emoji
       /react remove <emoji>        remove a rule
     """
     words = text.split()

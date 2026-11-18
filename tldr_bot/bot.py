@@ -63,8 +63,8 @@ REACTION_RULES_SETTING = "reaction_rules"
 MAX_PENDING_REACTIONS = 20
 
 REACT_USAGE = (
-    "/react add <emoji> <topic> adds a rule or changes its topic.\n"
-    "/react remove <emoji> removes a rule."
+    "/react add <emoji> <topic> adds a rule, or adds words to a rule that emoji already has.\n"
+    "/react remove <emoji> removes a rule, so remove and add again replaces a topic."
 )
 
 
@@ -471,13 +471,17 @@ class TldrBot:
             case ReactAdd(emoji=emoji, topic=topic):
                 if not is_emoji(emoji):
                     return f"{emoji} isn't an emoji.\n\n{REACT_USAGE}"
-                if len(topic) > MAX_TOPIC_CHARS:
-                    return f"That topic is too long, the limit is {MAX_TOPIC_CHARS} characters."
                 updated = with_rule(rules, ReactionRule(emoji, topic))
+                combined = next(r for r in updated if same_emoji(r.emoji, emoji))
+                # The words join whatever the emoji already reacted to, so the limit is about the result.
+                if len(combined.topic) > MAX_TOPIC_CHARS:
+                    return f"That topic is too long, the limit is {MAX_TOPIC_CHARS} characters."
                 if len(updated) > MAX_RULES:
                     return f"That's too many rules, the limit is {MAX_RULES}."
+                if updated == rules:
+                    return f"{emoji} already reacts to: {combined.topic}"
                 self.store.set_setting(REACTION_RULES_SETTING, dump_rules(updated))
-                return f"{emoji} now reacts to: {topic}"
+                return f"{emoji} now reacts to: {combined.topic}"
             case ReactRemove(emoji=emoji):
                 if not any(same_emoji(r.emoji, emoji) for r in rules):
                     return f"There's no rule for {emoji}."
