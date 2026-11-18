@@ -31,6 +31,7 @@ from tldr_bot.health import heartbeat, is_healthy
 from tldr_bot.llm import STATUS_URL, Choice, LLMClient, LLMError, ModelInfo
 from tldr_bot.reactions import (
     DEFAULT_RULES,
+    MAX_TOPIC_CHARS,
     MIN_CONFIDENCE,
     ReactAdd,
     ReactRemove,
@@ -825,16 +826,37 @@ async def test_react_commands_edit_rules_that_survive_a_restart():
     assert "isn't an emoji" in await send_command(bot, "/react add dog dogs", 2)
 
     assert await send_command(bot, "/react add 🐕 dogs", 3) == "🐕 now reacts to: dogs"
-    await send_command(bot, "/react add 🐈 only tigers", 4)
+    # Words added to an emoji that already has a rule join its topic instead of replacing it.
+    assert await send_command(bot, "/react add 🐈 only tigers", 4) == "🐈 now reacts to: cats, only tigers"
+    assert await send_command(bot, "/react add 🐈 Cats", 5) == "🐈 already reacts to: cats, only tigers"
     # Keyboards may or may not add the variation selector.
-    assert "Removed" in await send_command(bot, "/react remove 🛏", 5)
-    assert "no rule" in await send_command(bot, "/react remove 🦄", 6)
+    assert "Removed" in await send_command(bot, "/react remove 🛏", 6)
+    assert "no rule" in await send_command(bot, "/react remove 🦄", 7)
     assert bot.reaction_rules == (
-        ReactionRule("🐈", "only tigers"), *DEFAULT_RULES[1:4], ReactionRule("🐕", "dogs"),
+        ReactionRule("🐈", "cats, only tigers"), *DEFAULT_RULES[1:4], ReactionRule("🐕", "dogs"),
     )
 
     restarted = TldrBot(bot.cfg, bot.store, FakeSignal(), FakeLLM(), FakeCats(), FakeCatGen())
     assert restarted.reaction_rules == bot.reaction_rules
+
+
+async def test_adding_words_to_an_existing_rule_keeps_the_old_ones():
+    bot = make_bot()
+
+    assert await send_command(bot, "/react add 🐈 kittens", 1) == "🐈 now reacts to: cats, kittens"
+    # Parts of the topic the rule already has, in any case, are not added twice.
+    assert await send_command(bot, "/react add 🐈 Cats, dogs", 2) == "🐈 now reacts to: cats, kittens, dogs"
+
+    # The rule keeps its stored emoji, so the labels the model picks from still match it.
+    assert await send_command(bot, "/react add 🛏 napping", 3) == "🛏 now reacts to: sleep, being tired, going to bed, napping"
+    assert bot.reaction_rules[4] == ReactionRule("🛏️", "sleep, being tired, going to bed, napping")
+
+    # A rule at the limit refuses words that would push it over, and stays as it was.
+    at_limit = "x" * (MAX_TOPIC_CHARS - len("cats, kittens, dogs, "))
+    reply = await send_command(bot, f"/react add 🐈 {at_limit}", 4)
+    assert reply == f"🐈 now reacts to: cats, kittens, dogs, {at_limit}"
+    assert "too long" in await send_command(bot, "/react add 🐈 one more thing", 5)
+    assert bot.reaction_rules[0].topic == f"cats, kittens, dogs, {at_limit}"
 
 
 async def test_removing_every_rule_stops_llm_calls_and_stays_empty():
