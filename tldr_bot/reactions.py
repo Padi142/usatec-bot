@@ -64,16 +64,22 @@ def _topic_parts(topic: str) -> list[str]:
 
 def merge_topics(old: str, new: str) -> str:
     """Words added to a topic that already exists. Parts it already has change nothing."""
-    have = {part.lower() for part in _topic_parts(old)}
-    added = [part for part in _topic_parts(new) if part.lower() not in have]
-    return ", ".join(_topic_parts(old) + added) if added else old
+    parts = _topic_parts(old)
+    have = {part.lower() for part in parts}
+    added: list[str] = []
+    for part in _topic_parts(new):
+        key = part.lower()
+        if key not in have:
+            have.add(key)
+            added.append(part)
+    return ", ".join(parts + added) if added else old
 
 
 def with_rule(rules: tuple[ReactionRule, ...], rule: ReactionRule) -> tuple[ReactionRule, ...]:
     """Add a rule. For an emoji that already has one, the new words join its topic."""
     if not any(same_emoji(r.emoji, rule.emoji) for r in rules):
-        return (*rules, rule)
-    # The stored emoji stays as it is, so the rules and the model's labels keep matching it.
+        return (*rules, ReactionRule(rule.emoji, merge_topics("", rule.topic)))
+    # The stored emoji stays as it is, keeping its variation selector and letting no-ops compare equal.
     return tuple(
         ReactionRule(r.emoji, merge_topics(r.topic, rule.topic)) if same_emoji(r.emoji, rule.emoji) else r
         for r in rules
@@ -127,7 +133,7 @@ def parse_react_command(text: str) -> ReactCommand | None:
     if not words or words[0].lower() != "/react":
         return None
     match [word.lower() if i == 0 else word for i, word in enumerate(words[1:])]:
-        case ["add", emoji, *topic] if topic:
+        case ["add", emoji, *topic] if _topic_parts(" ".join(topic)):
             return ReactAdd(emoji, " ".join(topic))
         case ["remove", emoji]:
             return ReactRemove(emoji)

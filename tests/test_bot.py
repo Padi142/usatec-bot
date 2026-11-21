@@ -147,6 +147,7 @@ def test_parse_model_command(text, expected):
     ("/react add 🐈 cats and kittens", ReactAdd("🐈", "cats and kittens")),
     ("/REACT ADD 🐈 Cats", ReactAdd("🐈", "Cats")),
     ("/react add 🐈", ReactShow()),
+    ("/react add 🐈 , ,", ReactShow()),
     ("/react remove 🐈", ReactRemove("🐈")),
     ("/react model gemma4", ReactShow()),
     ("/react nonsense", ReactShow()),
@@ -844,18 +845,23 @@ async def test_adding_words_to_an_existing_rule_keeps_the_old_ones():
     bot = make_bot()
 
     assert await send_command(bot, "/react add 🐈 kittens", 1) == "🐈 now reacts to: cats, kittens"
-    # Parts of the topic the rule already has, in any case, are not added twice.
-    assert await send_command(bot, "/react add 🐈 Cats, dogs", 2) == "🐈 now reacts to: cats, kittens, dogs"
+    # Parts of the topic the rule already has, or repeated within the same add, are not added twice.
+    assert await send_command(bot, "/react add 🐈 Cats, dogs, Dogs", 2) == "🐈 now reacts to: cats, kittens, dogs"
 
-    # The rule keeps its stored emoji, so the labels the model picks from still match it.
+    # The rule keeps its stored emoji (including its variation selector), and no-ops stay no-ops.
     assert await send_command(bot, "/react add 🛏 napping", 3) == "🛏 now reacts to: sleep, being tired, going to bed, napping"
+    assert await send_command(bot, "/react add 🛏 Sleep", 4) == "🛏 already reacts to: sleep, being tired, going to bed, napping"
     assert bot.reaction_rules[4] == ReactionRule("🛏️", "sleep, being tired, going to bed, napping")
+
+    # New rules normalize and deduplicate comma-separated parts too, and comma-only topics show usage.
+    assert await send_command(bot, "/react add 🐶 dogs, Dogs", 5) == "🐶 now reacts to: dogs"
+    assert "Reaction rules:" in await send_command(bot, "/react add 🐈 ,", 6)
 
     # A rule at the limit refuses words that would push it over, and stays as it was.
     at_limit = "x" * (MAX_TOPIC_CHARS - len("cats, kittens, dogs, "))
-    reply = await send_command(bot, f"/react add 🐈 {at_limit}", 4)
+    reply = await send_command(bot, f"/react add 🐈 {at_limit}", 7)
     assert reply == f"🐈 now reacts to: cats, kittens, dogs, {at_limit}"
-    assert "too long" in await send_command(bot, "/react add 🐈 one more thing", 5)
+    assert "too long" in await send_command(bot, "/react add 🐈 one more thing", 8)
     assert bot.reaction_rules[0].topic == f"cats, kittens, dogs, {at_limit}"
 
 
