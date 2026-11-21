@@ -58,11 +58,32 @@ def same_emoji(a: str, b: str) -> bool:
     return a.replace(_VARIATION_SELECTOR, "") == b.replace(_VARIATION_SELECTOR, "")
 
 
+def _topic_parts(topic: str) -> list[str]:
+    return [part.strip() for part in topic.split(",") if part.strip()]
+
+
+def merge_topics(old: str, new: str) -> str:
+    """Words added to a topic that already exists. Parts it already has change nothing."""
+    parts = _topic_parts(old)
+    have = {part.lower() for part in parts}
+    added: list[str] = []
+    for part in _topic_parts(new):
+        key = part.lower()
+        if key not in have:
+            have.add(key)
+            added.append(part)
+    return ", ".join(parts + added) if added else old
+
+
 def with_rule(rules: tuple[ReactionRule, ...], rule: ReactionRule) -> tuple[ReactionRule, ...]:
-    """Add a rule, or replace the topic in place if the emoji already has one."""
-    if any(same_emoji(r.emoji, rule.emoji) for r in rules):
-        return tuple(rule if same_emoji(r.emoji, rule.emoji) else r for r in rules)
-    return (*rules, rule)
+    """Add a rule. For an emoji that already has one, the new words join its topic."""
+    if not any(same_emoji(r.emoji, rule.emoji) for r in rules):
+        return (*rules, ReactionRule(rule.emoji, merge_topics("", rule.topic)))
+    # The stored emoji stays as it is, keeping its variation selector and letting no-ops compare equal.
+    return tuple(
+        ReactionRule(r.emoji, merge_topics(r.topic, rule.topic)) if same_emoji(r.emoji, rule.emoji) else r
+        for r in rules
+    )
 
 
 def without_rule(rules: tuple[ReactionRule, ...], emoji: str) -> tuple[ReactionRule, ...]:
@@ -105,14 +126,14 @@ def parse_react_command(text: str) -> ReactCommand | None:
 
     Recognized forms:
       /react                       the rules and this usage
-      /react add <emoji> <topic>   add a rule, or change the topic of that emoji
+      /react add <emoji> <topic>   add a rule, or add words to the topic of that emoji
       /react remove <emoji>        remove a rule
     """
     words = text.split()
     if not words or words[0].lower() != "/react":
         return None
     match [word.lower() if i == 0 else word for i, word in enumerate(words[1:])]:
-        case ["add", emoji, *topic] if topic:
+        case ["add", emoji, *topic] if _topic_parts(" ".join(topic)):
             return ReactAdd(emoji, " ".join(topic))
         case ["remove", emoji]:
             return ReactRemove(emoji)
