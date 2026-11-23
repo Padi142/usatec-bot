@@ -389,6 +389,9 @@ class TldrBot:
                 log.info("/react from %s in group %s", event.sender_name, event.group_id)
                 self._spawn(self.run_react_command(event, react_command))
             case GroupMessage():
+                # Any picture can become a sticker later, even one sent with /tldr or delivered twice.
+                if event.image:
+                    self.store.add_image(event.group_id, event.sender_id, event.timestamp, event.image.id)
                 # The body, so a /tldr sent as a reply or with a picture still counts as one.
                 command = parse_command(event.body or "")
                 if command is None:
@@ -396,8 +399,6 @@ class TldrBot:
                     message = ChatMessage(event.group_id, event.sender_id, event.sender_name, event.timestamp, text)
                     # A redelivered message was already described and judged.
                     if self.store.add(message):
-                        if event.image:
-                            self.store.add_image(event.group_id, event.sender_id, event.timestamp, event.image.id)
                         self._queue_reaction(event)
                 else:
                     log.info("/tldr from %s in group %s", event.sender_name, event.group_id)

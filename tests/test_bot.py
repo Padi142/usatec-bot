@@ -1140,6 +1140,8 @@ async def test_tldr_with_a_picture_or_as_a_reply_is_a_command():
     await finish_tasks(bot)
     assert len(bot.llm.transcripts) == 3 and bot.llm.described == []
     assert [m.text for m in bot.store.last_before(GROUP, 100, 100)] == ["hello"]
+    # The picture sent with /tldr can still become a sticker.
+    assert bot.store.image(GROUP, ("uuid-alice",), 3) == "shot.png"
 
 
 def test_picture_text_cannot_pose_as_transcript_lines():

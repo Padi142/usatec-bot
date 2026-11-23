@@ -34,7 +34,7 @@ The rules can be changed in a group, or in a direct message to the bot:
 
 - `/react` — show the rules,
 - `/react add <emoji> <topic>` — add a rule, or add words to the topic that emoji already has (remove it first to replace the topic),
-- `/react remove <emoji>` — remove a rule (with no rules left, the bot stops calling the model).
+- `/react remove <emoji>` — remove a rule (with no rules left, the bot stops asking the decision model, but photos are still described for `/tldr`).
 
 Pictures get reactions too, so a cat photo gets 🐈 even without a caption. A vision model
 (`VISION_MODEL`, by default `gemma4`) describes up to 4 photos of a message (JPEG, PNG or WebP,
