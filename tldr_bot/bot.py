@@ -64,19 +64,23 @@ from .signal_api import (
 from .sticker_pack import (
     DEFAULT_EMOJI,
     MAX_STICKERS,
+    PNG_SIGNATURE,
     NewSticker,
     StickerAdd,
     StickerCommand,
+    StickerEmoji,
+    StickerList,
     StickerPackUploader,
     StickerRateLimited,
     StickerRemove,
     StickerUploadError,
     StickerUsage,
     make_sticker,
+    pack_sheet,
     parse_sticker_command,
 )
 from .stickers import Stickers, StickerError
-from .store import ChatMessage, MessageStore
+from .store import ChatMessage, MessageStore, PackSticker
 
 log = logging.getLogger(__name__)
 
@@ -123,7 +127,9 @@ MAX_STICKER_SOURCE_BYTES = 25 * 1024 * 1024
 
 STICKER_USAGE = (
     "Reply to an image with /sticker or /sticker 😺 to add it to the sticker pack.\n"
-    "/sticker remove 3 removes the third sticker."
+    "/sticker list shows the pack's stickers and their numbers.\n"
+    "/sticker remove 3 removes sticker 3, /sticker emoji 3 😺 changes its emoji.\n"
+    "Both work as a reply to a sticker too."
 )
 
 REACT_USAGE = (
@@ -358,6 +364,7 @@ class TldrBot:
 
     async def run(self) -> None:
         self._spawn(self.announce_updates())
+        self._spawn(self.convert_webp_stickers())
         async for payload in self.signal.events():
             try:
                 self.handle(payload)
@@ -482,6 +489,10 @@ class TldrBot:
                 # Any picture can become a sticker later, even one sent with /tldr or delivered twice.
                 if event.image:
                     self.store.add_image(event.group_id, event.sender_id, event.timestamp, event.image.id)
+                if event.sticker:
+                    self.store.add_sticker_message(
+                        event.group_id, event.timestamp, event.sticker.pack_id, event.sticker.sticker_id,
+                    )
                 # The body, so a /tldr sent as a reply or with a picture still counts as one.
                 command = parse_command(event.body or "")
                 if command is None:
@@ -530,11 +541,15 @@ class TldrBot:
             attachments=attachments,
             sticker=sticker,
         )
+        if timestamp is None:
+            return
         image = next((data for content_type, data in attachments or [] if content_type.startswith("image/")), None)
-        if timestamp is not None and image is not None:
+        if image is not None:
             self._own_images[(to.group_id, timestamp)] = image
             while len(self._own_images) > MAX_OWN_IMAGES:
                 del self._own_images[next(iter(self._own_images))]
+        if sticker is not None:
+            self.store.add_sticker_message(to.group_id, timestamp, sticker.pack_id, sticker.sticker_id)
 
     async def run_macka(self, msg: GroupMessage) -> None:
         try:
@@ -632,8 +647,12 @@ class TldrBot:
                     return self._sticker_usage()
                 case StickerAdd(emoji=emoji):
                     return await self._add_sticker(msg, emoji)
-                case StickerRemove(position=position):
-                    return await self._remove_sticker(position)
+                case StickerList():
+                    return await self._list_stickers(msg)
+                case StickerRemove(positions=positions):
+                    return await self._remove_stickers(msg, positions)
+                case StickerEmoji(emoji=emoji, position=position):
+                    return await self._set_sticker_emoji(msg, emoji, position)
         except StickerRateLimited:
             return "Signal only lets me upload about 20 sticker packs a day, try again later."
         except StickerUploadError as e:
@@ -692,19 +711,76 @@ class TldrBot:
             return missing
         return "That image is too big for a sticker." if image is None else image
 
-    async def _remove_sticker(self, position: int) -> str:
+    async def _list_stickers(self, msg: GroupMessage) -> str | None:
+        pack, stickers = self.store.sticker_pack(), self.store.stickers()
+        if pack is None:
+            return "The pack is empty."
+        sheet = await asyncio.to_thread(pack_sheet, [s.image for s in stickers])
+        caption = f"The pack has {len(stickers)} of {MAX_STICKERS} stickers:\n{pack.url}"
+        await self.reply(msg, caption, attachments=[("image/jpeg", sheet)])
+        return None
+
+    def _targets(self, msg: GroupMessage, positions: tuple[int, ...], stickers: list[PackSticker]) -> list[int] | str:
+        """The 1-based positions of the stickers a command names, by number or by replying to one.
+
+        A string says why there are none.
+        """
+        if not positions:
+            sticker_id = self.store.sticker_message(msg.group_id, msg.quote.timestamp) if msg.quote else None
+            ids = [s.id for s in stickers]
+            if sticker_id not in ids:
+                return "Reply to a sticker from the pack, or give its number. /sticker list shows the numbers."
+            return [ids.index(sticker_id) + 1]
+        if missing := [p for p in positions if p > len(stickers)]:
+            return f"There's no sticker {missing[0]}, the pack has {len(stickers)}."
+        return sorted(set(positions))
+
+    async def _remove_stickers(self, msg: GroupMessage, positions: tuple[int, ...]) -> str:
         assert self.sticker_packs is not None
         async with self._sticker_lock:
             stickers = self.store.stickers()
-            if position > len(stickers):
-                return f"There's no sticker {position}, the pack has {len(stickers)}."
-            removed = stickers[position - 1]
-            remaining = [s for s in stickers if s.id != removed.id]
+            targets = self._targets(msg, positions, stickers)
+            if isinstance(targets, str):
+                return targets
+            removed = {stickers[p - 1].id for p in targets}
+            remaining = [s for s in stickers if s.id not in removed]
             pack = await self.sticker_packs.upload(remaining) if remaining else None
-            self.store.remove_sticker(removed.id, pack)
+            self.store.remove_stickers(list(removed), pack)
         if pack is None:
             return "Removed the last sticker, the pack is empty now."
-        return f"Removed sticker {position}. The new pack:\n{pack.url}"
+        removed_names = f"stickers {', '.join(map(str, targets))}" if len(targets) > 1 else f"sticker {targets[0]}"
+        return f"Removed {removed_names}. The new pack:\n{pack.url}"
+
+    async def _set_sticker_emoji(self, msg: GroupMessage, emoji: str, position: int | None) -> str:
+        assert self.sticker_packs is not None
+        if not is_emoji(emoji):
+            return f"{emoji} isn't an emoji.\n\n{STICKER_USAGE}"
+        async with self._sticker_lock:
+            stickers = self.store.stickers()
+            targets = self._targets(msg, () if position is None else (position,), stickers)
+            if isinstance(targets, str):
+                return targets
+            [target] = targets
+            changed = stickers[target - 1]
+            pack = await self.sticker_packs.upload(
+                [NewSticker(s.image, emoji) if s.id == changed.id else s for s in stickers]
+            )
+            self.store.set_sticker_emoji(changed.id, emoji, pack)
+        return f"Sticker {target} is {emoji} now. The new pack:\n{pack.url}"
+
+    async def convert_webp_stickers(self) -> None:
+        """Turn stickers saved before stickers were PNGs into PNGs. Never raises.
+
+        signal-cli sends WebP stickers without a picture type, see STICKER_CONTENT_TYPE.
+        """
+        try:
+            async with self._sticker_lock:
+                for sticker in self.store.stickers():
+                    if not sticker.image.startswith(PNG_SIGNATURE):
+                        self.store.set_sticker_image(sticker.id, await asyncio.to_thread(make_sticker, sticker.image))
+                        log.info("Converted sticker %d to PNG", sticker.id)
+        except Exception:
+            log.exception("Converting stickers to PNG failed")
 
     @property
     def reaction_rules(self) -> tuple[ReactionRule, ...]:
