@@ -91,7 +91,7 @@ class Config:
     github_repo: str = "Padi142/usatec-bot"
     # Post a "What's new" summary to allowed_groups when a deploy brings new commits.
     announce_updates: bool = True
-    # The commit this container was built from. Coolify sets SOURCE_COMMIT; without it, no announcements.
+    # The commit this container was built from. Without it, announcements use master's newest commit.
     source_commit: str | None = None
     # signal-cli's data directory, for the account credentials /sticker uploads packs with.
     # Without it, /sticker is disabled.

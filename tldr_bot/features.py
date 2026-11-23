@@ -132,6 +132,15 @@ class GitHubClient:
         except (httpx.HTTPError, ValueError, KeyError, TypeError) as e:
             raise GitHubError(f"{type(e).__name__}: {e}") from e
 
+    async def head(self, branch: str) -> str:
+        """The SHA of the newest commit on branch."""
+        try:
+            resp = await self._http.get(f"/repos/{self.repo}/commits/{branch}")
+            resp.raise_for_status()
+            return str(resp.json()["sha"])
+        except (httpx.HTTPError, ValueError, KeyError, TypeError) as e:
+            raise GitHubError(f"{type(e).__name__}: {e}") from e
+
     async def compare(self, base: str, head: str) -> Comparison | None:
         """What head has that base doesn't. None if GitHub knows head but not base, like after a force-push.
 

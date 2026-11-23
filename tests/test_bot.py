@@ -1660,6 +1660,11 @@ class FakeIssues:
         n = len(self.created)
         return Issue(n, f"https://github.com/o/r/issues/{n}", frozenset(labels if self.keeps_labels else ()))
 
+    async def head(self, branch):
+        if self.error:
+            raise self.error
+        return self.commits[0].sha
+
     async def compare(self, base, head):
         """self.commits is the history, newest first, and base is looked up in it."""
         if self.error:
@@ -2155,12 +2160,18 @@ async def test_announce_marks_a_capped_list_and_handles_unknown_commits():
     assert len(bot.signal.sent) == 1 and bot.store.setting(ANNOUNCED_COMMIT_PREFIX + GROUP) == "sha30"
 
 
+async def test_without_source_commit_master_is_announced():
+    bot = announce_bot(deployed=None)
+    heard(bot, "sha1")
+    await bot.announce_updates()
+    assert len(bot.signal.sent) == 2 and announced(bot) == {GROUP: "sha3", OTHER_GROUP: "sha3"}
+
+
 @pytest.mark.parametrize("overrides", [
     {"allowed_groups": frozenset()},
-    {"source_commit": None},
     {"announce_updates": False},
 ])
-async def test_announce_needs_allowed_groups_a_source_commit_and_the_switch(overrides):
+async def test_announce_needs_allowed_groups_and_the_switch(overrides):
     bot = announce_bot(**overrides)
     heard(bot, "sha1")
     await bot.announce_updates()
@@ -2220,3 +2231,13 @@ async def test_announce_gives_up_if_signal_never_connects(monkeypatch):
     bot.signal.connected = False
     await bot.announce_updates()
     assert bot.signal.sent == [] and announced(bot) == {GROUP: "sha1", OTHER_GROUP: "sha1"}
+
+
+async def test_github_head():
+    def handler(request: httpx.Request):
+        assert request.url.path == "/repos/o/r/commits/master"
+        return httpx.Response(200, json={"sha": "abc"})
+
+    client = GitHubClient(None, "o/r")
+    client._http._transport = httpx.MockTransport(handler)
+    assert await client.head("master") == "abc"

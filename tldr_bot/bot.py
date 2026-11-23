@@ -93,6 +93,8 @@ TIME_RE = re.compile(r"^(\d{1,2}):(\d{2})$")
 # Settings key for the model chosen with /model.
 MODEL_SETTING = "llm_model"
 REACTION_RULES_SETTING = "reaction_rules"
+# Coolify deploys this branch. Its head stands in for the deployed commit without SOURCE_COMMIT.
+DEPLOYED_BRANCH = "master"
 # Per group, the commit it last heard about, so a failed send only retries that group.
 ANNOUNCED_COMMIT_PREFIX = "announced_commit:"
 
@@ -370,14 +372,18 @@ class TldrBot:
             log.exception("Deploy announcement failed")
 
     async def _announce_updates(self) -> None:
-        deployed = self.cfg.source_commit
-        if self.github is None or deployed is None:
-            log.info("Skipping deploy announcement: SOURCE_COMMIT isn't set")
+        if self.github is None:
             return
         if not self.cfg.allowed_groups:
             # A linked personal account sees every group, so never broadcast to all of them.
             log.info("Skipping deploy announcement: ALLOWED_GROUPS is empty")
             return
+        deployed = self.cfg.source_commit
+        if deployed is None:
+            # Coolify doesn't pass SOURCE_COMMIT into compose containers, and it deploys master,
+            # so master's head is what runs unless something merged while this deploy built.
+            deployed = await self.github.head(DEPLOYED_BRANCH)
+            log.info("SOURCE_COMMIT isn't set, announcing up to %s's latest commit", DEPLOYED_BRANCH)
 
         behind: dict[str, list[str]] = {}  # last announced commit -> groups that last heard of it
         for group_id in sorted(self.cfg.allowed_groups):
