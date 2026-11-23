@@ -10,7 +10,7 @@ from .health import heartbeat
 from .llm import LLMClient
 from .signal_api import SignalClient
 from .sticker_pack import StickerPackUploader
-from .stickers import StickerEmojis
+from .stickers import Stickers
 from .store import MessageStore
 
 
@@ -21,7 +21,7 @@ async def main() -> None:
     llm = LLMClient(cfg.llm_base_url, cfg.llm_api_key, cfg.llm_timeout)
     cats = CatClient()
     cat_gen = CatGenClient(cfg.cat_gen_api_key) if cfg.cat_gen_api_key else None
-    stickers = StickerEmojis(signal)
+    stickers = Stickers(signal)
     github = GitHubClient(cfg.github_token, cfg.github_repo)
     packs = StickerPackUploader(cfg.signal_cli_dir, cfg.signal_number) if cfg.signal_cli_dir else None
     health = asyncio.create_task(heartbeat(signal))

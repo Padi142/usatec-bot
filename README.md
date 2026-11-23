@@ -42,9 +42,11 @@ up to 5 MB each), including any readable text in screenshots. That description i
 message for `/tldr` summaries, and the decision model judges it together with the text.
 d3-flash reads images itself, but e-INFRA's gateway drops them. Videos, GIFs and files aren't judged.
 
-Stickers get reactions too, judged by the emoji their pack gives them: a 😴 sticker gets 🛏️.
-The bot downloads each sticker pack's manifest from Signal's CDN once, to read those emojis,
-because signal-cli doesn't pass them on.
+Stickers get reactions too, judged by the emoji their pack gives them and by their picture, which
+the vision model describes like a photo: a 😴 sticker gets 🛏️, and a 🙂 sticker of a cat gets 🐈.
+Animated stickers are described by their first frame. Each sticker is described once, until the
+bot restarts. The bot downloads each sticker pack's manifest from Signal's CDN once, to read those
+emojis, because signal-cli doesn't pass them on, and the sticker's picture from there too.
 
 Rules apply to all groups and survive restarts. Direct messages only accept `/react`, and only
 from someone who has already written in one of the bot's groups; everyone else is ignored. If the
