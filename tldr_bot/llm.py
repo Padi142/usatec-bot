@@ -2,7 +2,8 @@
 
 import logging
 import re
-from collections.abc import Iterator, Mapping
+import base64
+from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 
@@ -33,6 +34,12 @@ Rules:
 - Write in the language most of the conversation is written in.
 - Output plain text only. Signal does not render Markdown, so do not use #, ** or tables.
 """
+
+DESCRIBE_PROMPT = (
+    "Describe what these pictures from a group chat show, in one short sentence. "
+    "Name the main subjects, like animals, food, drinks, vehicles or people, and what they are doing."
+)
+DESCRIPTION_TOKENS = 80
 
 _THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
 
@@ -157,11 +164,29 @@ class LLMClient:
         """Send a prompt as it is, with the model's default settings."""
         return await self._chat(model, [{"role": "user", "content": text}])
 
-    async def _chat(self, model: str, messages: list[dict[str, str]], temperature: float | None = None) -> str:
-        options = {} if temperature is None else {"temperature": temperature}
+    async def describe_images(self, images: Sequence[tuple[str, bytes]], model: str) -> str:
+        """A short description of pictures, given as (content type, data), from a vision chat model.
+
+        The decision model reads this instead of the pictures, because e-INFRA's gateway
+        drops the images that /systemone requests carry.
+        """
+        content: list[dict] = [{"type": "text", "text": DESCRIBE_PROMPT}] + [
+            {"type": "image_url", "image_url": {"url": f"data:{content_type};base64,{base64.b64encode(data).decode()}"}}
+            for content_type, data in images
+        ]
+        return await self._chat(
+            model, [{"role": "user", "content": content}], temperature=0, max_tokens=DESCRIPTION_TOKENS,
+            timeout=QUICK_TIMEOUT,
+        )
+
+    async def _chat(self, model: str, messages: list[dict], timeout: float | None = None, **options: float) -> str:
+        """The model's answer to messages. options are request fields like temperature."""
         with _llm_errors():
             resp = await self._http.post(
-                "/chat/completions", json={"model": model, "messages": messages, **options},
+                "/chat/completions",
+                json={"model": model, "messages": messages, **options},
+                # None keeps the client's own timeout, which summaries need.
+                **({} if timeout is None else {"timeout": timeout}),
             )
             resp.raise_for_status()
             content = resp.json()["choices"][0]["message"]["content"]

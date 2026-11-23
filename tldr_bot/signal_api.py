@@ -31,6 +31,13 @@ class Sticker:
 
 
 @dataclass(frozen=True)
+class Attachment:
+    id: str  # what signal-cli saved it as, for GET /v1/attachments/{id}
+    content_type: str
+    size: int | None = None  # in bytes, when signal-cli reports it
+
+
+@dataclass(frozen=True)
 class GroupMessage:
     group_id: str
     sender_id: str
@@ -42,6 +49,7 @@ class GroupMessage:
     # What the sender typed, without the quote and attachment markers `text` has.
     body: str | None = None
     sticker: Sticker | None = None
+    attachments: tuple[Attachment, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -102,6 +110,14 @@ def _sticker(data: dict) -> Sticker | None:
     if isinstance(pack_id, str) and isinstance(sticker_id, int):
         return Sticker(pack_id.lower(), sticker_id)
     return None
+
+
+def _attachments(data: dict) -> tuple[Attachment, ...]:
+    return tuple(
+        Attachment(a["id"], a["contentType"].lower(), a.get("size") if isinstance(a.get("size"), int) else None)
+        for a in data.get("attachments") or []
+        if isinstance(a.get("id"), str) and isinstance(a.get("contentType"), str)
+    )
 
 
 def _mentions(data: dict) -> list[Mention]:
@@ -167,7 +183,7 @@ def parse_event(payload: dict) -> Event | None:
     timestamp = data.get("timestamp") or env.get("timestamp")
     return GroupMessage(
         group_id, sender_id, sender_name, sender_number, timestamp, text, _mentions(data), data.get("message"),
-        _sticker(data),
+        _sticker(data), _attachments(data),
     )
 
 
@@ -263,6 +279,12 @@ class SignalClient:
             },
         )
         resp.raise_for_status()
+
+    async def attachment(self, attachment_id: str) -> bytes:
+        """The contents of an attachment signal-cli has downloaded."""
+        resp = await self._http.get(f"/v1/attachments/{attachment_id}")
+        resp.raise_for_status()
+        return resp.content
 
     async def sticker_pack_key(self, pack_id: str) -> str | None:
         """The hex key of a sticker pack the account has seen, or None if it hasn't."""

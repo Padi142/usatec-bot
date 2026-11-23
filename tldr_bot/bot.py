@@ -7,6 +7,8 @@ from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
+import httpx
+
 from .cats import GRID_LAYOUTS, CatClient, CatError, CatGenClient
 from .config import Config
 from .features import (
@@ -23,6 +25,7 @@ from .features import (
 from .llm import LLMClient, LLMError, ModelInfo
 from .reactions import (
     INSTRUCTIONS,
+    MAX_IMAGE_BYTES,
     MAX_MESSAGE_CHARS,
     MAX_RULES,
     MAX_TOPIC_CHARS,
@@ -34,6 +37,8 @@ from .reactions import (
     build_criteria,
     dump_rules,
     is_emoji,
+    judged_images,
+    judged_state,
     load_rules,
     parse_react_command,
     pick_rule,
@@ -458,8 +463,12 @@ class TldrBot:
         return load_rules(self.store.setting(REACTION_RULES_SETTING))
 
     def _queue_reaction(self, msg: GroupMessage) -> None:
-        # Bare attachments have nothing to judge.
-        judgeable = bool(msg.body) or (msg.sticker is not None and self.stickers is not None)
+        # Other attachments, like files and videos, have nothing to judge.
+        judgeable = (
+            bool(msg.body)
+            or bool(judged_images(msg.attachments))
+            or (msg.sticker is not None and self.stickers is not None)
+        )
         if not judgeable or not self.reaction_rules:
             return
         if self._pending_reactions >= MAX_PENDING_REACTIONS:
@@ -480,7 +489,7 @@ class TldrBot:
     async def _react(self, msg: GroupMessage) -> None:
         """React if the message matches a rule. A failure only costs the reaction, the chat sees nothing."""
         rules = self.reaction_rules
-        state = await self._judged_content(msg)
+        state = judged_state(await self._judged_text(msg), await self._picture_description(msg))
         if not state:
             return
         try:
@@ -494,8 +503,27 @@ class TldrBot:
                 msg.group_id, rule.emoji, msg.sender_number or msg.sender_id, msg.timestamp,
             )
 
-    async def _judged_content(self, msg: GroupMessage) -> str | None:
-        """What the decision model sees: the typed text, or a sticker's emoji on its own."""
+    async def _picture_description(self, msg: GroupMessage) -> str | None:
+        """What the message's pictures show, or None without pictures or when that fails."""
+        images: list[tuple[str, bytes]] = []
+        for attachment in judged_images(msg.attachments):
+            try:
+                data = await self.signal.attachment(attachment.id)
+            except httpx.HTTPError as e:
+                log.warning("Attachment download failed: %s", e)
+                continue
+            if len(data) <= MAX_IMAGE_BYTES:
+                images.append((attachment.content_type, data))
+        if not images:
+            return None
+        try:
+            return await self.llm.describe_images(images, self.cfg.vision_model)
+        except LLMError as e:
+            log.warning("Picture description failed: %s", e)
+            return None
+
+    async def _judged_text(self, msg: GroupMessage) -> str | None:
+        """What the decision model reads: the typed text, or a sticker's emoji on its own."""
         if msg.body:
             return render_mentions(msg.body, msg.mentions, self.store.display_name)[:MAX_MESSAGE_CHARS]
         if msg.sticker is None or self.stickers is None:
