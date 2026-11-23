@@ -27,6 +27,15 @@ from tldr_bot.bot import (
 )
 from tldr_bot.cats import CatClient, CatError, CatGenClient
 from tldr_bot.config import Config, normalize_group_id
+from tldr_bot.features import (
+    MAX_TITLE_CHARS,
+    FeatureCommand,
+    GitHubError,
+    GitHubIssues,
+    Issue,
+    issue_title,
+    parse_feature_command,
+)
 from tldr_bot.health import heartbeat, is_healthy
 from tldr_bot.llm import STATUS_URL, Choice, LLMClient, LLMError, ModelInfo
 from tldr_bot.reactions import (
@@ -1330,3 +1339,72 @@ def test_stale_heartbeat(tmp_path):
     assert is_healthy(path)
     os.utime(path, (0, 0))
     assert not is_healthy(path)
+
+
+# --- /feature -----------------------------------------------------------------
+
+@pytest.mark.parametrize("text, expected", [
+    ("/feature", FeatureCommand()),
+    ("/FEATURE  add a /weather command ", FeatureCommand(request="add a /weather command")),
+    ("/feature line one\nline two", FeatureCommand(request="line one\nline two")),
+    ("/features please", None),
+])
+def test_parse_feature_command(text, expected):
+    assert parse_feature_command(text) == expected
+
+
+def test_issue_title_uses_the_first_line_cut_at_a_word():
+    assert issue_title("Add  weather\nwith details") == "Add weather"
+    long = issue_title("word " * 40)
+    assert len(long) <= MAX_TITLE_CHARS and long.endswith("word…")
+
+
+async def test_github_issue_request():
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request):
+        requests.append(request)
+        return httpx.Response(201, json={"number": 7, "html_url": "https://github.com/o/r/issues/7"})
+
+    issues = GitHubIssues("tok", "o/r")
+    issues._http._transport = httpx.MockTransport(handler)
+    assert await issues.create("t", "b", ["feature-request"]) == Issue(7, "https://github.com/o/r/issues/7")
+    assert requests[0].url.path == "/repos/o/r/issues"
+    assert requests[0].headers["authorization"] == "Bearer tok"
+    assert json.loads(requests[0].content) == {"title": "t", "body": "b", "labels": ["feature-request"]}
+
+
+class FakeIssues:
+    def __init__(self, error=None):
+        self.created = []
+        self.error = error
+
+    async def create(self, title, body, labels):
+        if self.error:
+            raise self.error
+        self.created.append((title, body, labels))
+        return Issue(len(self.created), f"https://github.com/o/r/issues/{len(self.created)}")
+
+
+async def test_feature_files_a_labeled_issue_with_only_the_display_name():
+    bot = make_bot()
+    bot.issues = FakeIssues()
+    reply = await send_command(bot, "/feature add a /weather command", 1)
+    assert reply.startswith("Saved as #1") and "issues/1" in reply
+    [(title, body, labels)] = bot.issues.created
+    assert title == "add a /weather command" and labels == ["feature-request"]
+    assert "by Alice" in body and "uuid-alice" not in body
+    # Commands aren't chat: not summarized, and no reaction.
+    assert bot.store.last_before(GROUP, 100, 100) == [] and bot.llm.decisions == []
+
+
+@pytest.mark.parametrize("issues, text, expected", [
+    (None, "/feature x", "aren't set up"),
+    (FakeIssues(), "/feature", "Usage"),
+    (FakeIssues(), "/feature " + "x" * 2001, "too long"),
+    (FakeIssues(GitHubError("boom")), "/feature x", "couldn't save"),
+])
+async def test_feature_failures_are_explained(issues, text, expected):
+    bot = make_bot()
+    bot.issues = issues
+    assert expected in await send_command(bot, text, 1)
