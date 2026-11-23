@@ -1652,6 +1652,7 @@ class FakeIssues:
         self.error = error
         self.keeps_labels = keeps_labels
         self.commits = commits if commits is not None else []
+        self.lookups = 0  # head and compare calls
 
     async def create(self, title, body, labels):
         if self.error:
@@ -1661,12 +1662,14 @@ class FakeIssues:
         return Issue(n, f"https://github.com/o/r/issues/{n}", frozenset(labels if self.keeps_labels else ()))
 
     async def head(self, branch):
+        self.lookups += 1
         if self.error:
             raise self.error
         return self.commits[0].sha
 
     async def compare(self, base, head):
         """self.commits is the history, newest first, and base is looked up in it."""
+        self.lookups += 1
         if self.error:
             raise self.error
         shas = [c.sha for c in self.commits]
@@ -2172,18 +2175,20 @@ async def test_without_source_commit_master_is_announced():
     {"announce_updates": False},
 ])
 async def test_announce_needs_allowed_groups_and_the_switch(overrides):
-    bot = announce_bot(**overrides)
+    bot = announce_bot(deployed=None, **overrides)
     heard(bot, "sha1")
     await bot.announce_updates()
-    assert bot.signal.sent == [] and bot.llm.commit_logs == []
+    assert bot.signal.sent == [] and bot.llm.commit_logs == [] and bot.github.lookups == 0
 
 
-async def test_a_github_error_announces_nothing_and_keeps_the_last_commit():
-    bot = announce_bot()
-    heard(bot, "sha1")
+@pytest.mark.parametrize("deployed", ["sha3", None])  # None looks up master's head, which fails first
+async def test_a_github_error_announces_nothing_and_keeps_the_last_commits(deployed):
+    bot = announce_bot(deployed=deployed)
+    bot.store.set_setting(ANNOUNCED_COMMIT_PREFIX + GROUP, "sha1")
+    bot.store.set_setting(ANNOUNCED_COMMIT_PREFIX + OTHER_GROUP, "sha2")
     bot.github.error = GitHubError("rate limit")
     await bot.announce_updates()
-    assert bot.signal.sent == [] and announced(bot) == {GROUP: "sha1", OTHER_GROUP: "sha1"}
+    assert bot.signal.sent == [] and announced(bot) == {GROUP: "sha1", OTHER_GROUP: "sha2"}
 
 
 def test_announce_config_from_env(monkeypatch):
