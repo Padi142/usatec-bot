@@ -133,13 +133,16 @@ class GitHubClient:
             raise GitHubError(f"{type(e).__name__}: {e}") from e
 
     async def compare(self, base: str, head: str) -> Comparison | None:
-        """What head has that base doesn't. None if GitHub doesn't know base, like after a force-push.
+        """What head has that base doesn't. None if GitHub knows head but not base, like after a force-push.
 
         A rollback (head behind base) has no commits.
         """
         try:
             resp = await self._http.get(f"/repos/{self.repo}/compare/{base}...{head}")
             if resp.status_code == 404:
+                # GitHub says 404 for an unknown repo or head too, which must not reset anything.
+                check = await self._http.get(f"/repos/{self.repo}/commits/{head}")
+                check.raise_for_status()
                 return None
             resp.raise_for_status()
             data = resp.json()

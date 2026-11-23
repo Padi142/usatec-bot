@@ -89,6 +89,7 @@ from tldr_bot.stickers import (
 )
 from tldr_bot import stickers as stickers_module
 from tldr_bot.signal_api import (
+    sent_timestamp,
     Attachment,
     DirectMessage,
     Sticker,
@@ -2022,8 +2023,10 @@ async def test_github_compare_with_and_without_token():
 
     def handler(request: httpx.Request):
         requests.append(request)
-        if "gone" in request.url.path:
+        if "gone" in request.url.path or request.url.path.endswith("/commits/missing"):
             return httpx.Response(404, json={"message": "Not Found"})
+        if request.url.path.startswith("/repos/o/r/commits/"):
+            return httpx.Response(200, json={"sha": "sha2"})
         return httpx.Response(200, json={"ahead_by": 2, "commits": [
             {"sha": "sha1", "commit": {"message": "Initial commit"}},
             {"sha": "sha2", "commit": {"message": "Add /weather\n\nShows the forecast."}},
@@ -2037,12 +2040,15 @@ async def test_github_compare_with_and_without_token():
             (Commit("sha2", "Add /weather\n\nShows the forecast."), Commit("sha1", "Initial commit")), 2,
         )
         assert await client.compare("gone", "sha2") is None
+        # An unknown head or repo is an error, not a reason to start over.
+        with pytest.raises(GitHubError):
+            await client.compare("gone", "missing")
         await client.close()
         assert client.can_file_issues == (token is not None)
 
     assert requests[0].url.path == "/repos/o/r/compare/sha0...sha2"
     assert "authorization" not in requests[0].headers
-    assert requests[2].headers["authorization"] == "Bearer tok"
+    assert requests[5].headers["authorization"] == "Bearer tok"
 
 
 async def test_llm_summarize_commits():
@@ -2108,7 +2114,7 @@ async def test_a_failed_send_retries_only_that_group():
     async def flaky_send(group_id, text, **kwargs):
         if group_id == OTHER_GROUP:
             raise httpx.ConnectError("down")
-        await send(group_id, text, **kwargs)
+        return await send(group_id, text, **kwargs)
 
     bot.signal.send_group = flaky_send
     await bot.announce_updates()
@@ -2175,3 +2181,42 @@ def test_announce_config_from_env(monkeypatch):
         monkeypatch.setenv(name, val)
     cfg = Config.from_env()
     assert cfg.announce_updates is False and cfg.source_commit == "abc"
+
+
+@pytest.mark.parametrize("response, expected", [
+    ([{"timestamp": "123"}], 123),
+    ([{"timestamp": "123", "errors": {"recipients": [{"uuid": "u", "reason": "UNREGISTERED_FAILURE"}]}}], 123),
+    ({"timestamp": "456"}, 456),
+    ([], None),
+    ({"error": "nope"}, None),
+])
+def test_sent_timestamp_reads_both_send_response_shapes(response, expected):
+    assert sent_timestamp(response) == expected
+
+
+async def test_an_unconfirmed_send_keeps_the_last_commit():
+    bot = announce_bot(allowed_groups=frozenset({GROUP}))
+    bot.store.set_setting(ANNOUNCED_COMMIT_PREFIX + GROUP, "sha1")
+
+    async def unconfirmed(group_id, text, **kwargs):
+        return None
+
+    bot.signal.send_group = unconfirmed
+    await bot.announce_updates()
+    assert bot.store.setting(ANNOUNCED_COMMIT_PREFIX + GROUP) == "sha1"
+
+
+async def test_a_rollback_posts_nothing_and_moves_back():
+    bot = announce_bot(deployed="sha1")
+    heard(bot, "sha3")
+    await bot.announce_updates()
+    assert bot.signal.sent == [] and announced(bot) == {GROUP: "sha1", OTHER_GROUP: "sha1"}
+
+
+async def test_announce_gives_up_if_signal_never_connects(monkeypatch):
+    monkeypatch.setattr(bot_module, "SIGNAL_READY_TIMEOUT", 0.01)
+    bot = announce_bot()
+    heard(bot, "sha1")
+    bot.signal.connected = False
+    await bot.announce_updates()
+    assert bot.signal.sent == [] and announced(bot) == {GROUP: "sha1", OTHER_GROUP: "sha1"}

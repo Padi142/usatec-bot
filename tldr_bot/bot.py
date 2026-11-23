@@ -96,8 +96,10 @@ REACTION_RULES_SETTING = "reaction_rules"
 # Per group, the commit it last heard about, so a failed send only retries that group.
 ANNOUNCED_COMMIT_PREFIX = "announced_commit:"
 
-# Waiting for Signal plus the whole announcement, so a stuck API never leaves the task hanging.
-ANNOUNCE_TIMEOUT = 300.0
+# How long the announcement waits for the Signal connection, and then how long it may take.
+# Separate, so a slow start can't eat the time the announcement needs.
+SIGNAL_READY_TIMEOUT = 300.0
+ANNOUNCE_TIMEOUT = 120.0
 # The summary gets less, so there's time left to send the commit titles instead.
 ANNOUNCE_SUMMARY_TIMEOUT = 60.0
 MAX_ANNOUNCEMENT_CHARS = 1500
@@ -359,9 +361,10 @@ class TldrBot:
         if not self.cfg.announce_updates:
             return
         try:
-            async with asyncio.timeout(ANNOUNCE_TIMEOUT):
+            async with asyncio.timeout(SIGNAL_READY_TIMEOUT):
                 while not self.signal.connected:
                     await asyncio.sleep(1)
+            async with asyncio.timeout(ANNOUNCE_TIMEOUT):
                 await self._announce_updates()
         except Exception:
             log.exception("Deploy announcement failed")
@@ -391,10 +394,13 @@ class TldrBot:
             for group_id in group_ids:
                 if text is not None:
                     try:
-                        await self.signal.send_group(group_id, text)
+                        timestamp = await self.signal.send_group(group_id, text)
                     except httpx.HTTPError as e:
                         log.error("Deploy announcement to group %s failed: %s", group_id, e)
                         continue  # the next start tries this group again
+                    if timestamp is None:
+                        log.error("Signal didn't confirm the deploy announcement to group %s", group_id)
+                        continue
                 # Also when there's nothing to say: a rollback, or a commit GitHub no longer knows.
                 self.store.set_setting(ANNOUNCED_COMMIT_PREFIX + group_id, deployed)
 
