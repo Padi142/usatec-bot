@@ -25,6 +25,7 @@ services:
       - LLM_BASE_URL=${LLM_BASE_URL:-https://llm.ai.e-infra.cz/v1}
       - LLM_MODEL=${LLM_MODEL:-deepseek}
       - REACTION_MODEL=${REACTION_MODEL:-}
+      - VISION_MODEL=${VISION_MODEL:-}
       - LLM_TIMEOUT=${LLM_TIMEOUT:-}
       - LLM_MAX_INPUT_CHARS=${LLM_MAX_INPUT_CHARS:-}
       - TLDR_DEFAULT_COUNT=${TLDR_DEFAULT_COUNT:-}
@@ -32,6 +33,8 @@ services:
       - HISTORY_LIMIT=${HISTORY_LIMIT:-}
       - ALLOWED_GROUPS=${ALLOWED_GROUPS:-}
       - CAT_GEN_API_KEY=${CAT_GEN_API_KEY:-}
+      - GITHUB_TOKEN=${GITHUB_TOKEN:-}
+      - GITHUB_REPO=${GITHUB_REPO:-}
       - SIGNAL_CLI_DIR=/signal-cli
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
       - TZ=${TZ:-Europe/Prague}

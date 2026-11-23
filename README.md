@@ -36,6 +36,11 @@ The rules can be changed in a group, or in a direct message to the bot:
 - `/react add <emoji> <topic>` — add a rule, or add words to the topic that emoji already has (remove it first to replace the topic),
 - `/react remove <emoji>` — remove a rule (with no rules left, the bot stops calling the model).
 
+Pictures get reactions too, so a cat photo gets 🐈 even without a caption. A vision model
+(`VISION_MODEL`, by default `gemma4`) describes up to 4 photos of a message (JPEG, PNG or WebP,
+up to 5 MB each) in a sentence, and the decision model judges that together with the text.
+d3-flash reads images itself, but e-INFRA's gateway drops them. Videos, GIFs and files aren't judged.
+
 Stickers get reactions too, judged by the emoji their pack gives them: a 😴 sticker gets 🛏️.
 The bot downloads each sticker pack's manifest from Signal's CDN once, to read those emojis,
 because signal-cli doesn't pass them on.
@@ -56,6 +61,13 @@ with the `flowmatch-cats-tti` text-to-cat model. `/mackagen 2x2`, `/mackagen 3x3
 and `/mackagen 5x5` make a grid of 4, 9, 16 or 25 cats in one picture (only without a prompt). Generating takes around 20 seconds, and
 it needs `CAT_GEN_API_KEY` to be set.
 
+`/feature <request>` saves a feature request as a GitHub issue labeled `feature-request`,
+and replies with its link. Open requests get built in batches, see
+[`.claude/skills/build-features`](.claude/skills/build-features/SKILL.md). The repo is public,
+so the request and the sender's display name are public too. Phone numbers are masked and
+GitHub mentions don't notify anyone. Each person can send one request every 5 minutes.
+It needs `GITHUB_TOKEN`: a fine-grained token with only **Issues: read and write** on this repo,
+from an account with write access to it, or GitHub drops the label.
 `/sticker` as a reply to an image adds it to the sticker pack all groups share, and the bot
 replies with the new sticker. Tap it to install the pack. `/sticker 😺` gives the sticker an emoji,
 and an image sent with `/sticker` as its caption works too. `/sticker remove 3` removes the third
@@ -80,7 +92,7 @@ summarizes from there. As a result:
 
 It's a good idea to tell the group that a bot is storing their messages and
 sending them to e-INFRA CZ: for summarization when someone asks, and each new
-message as it arrives to pick a reaction. See e-INFRA's
+message as it arrives, photos included, to pick a reaction. See e-INFRA's
 [data privacy notes](https://docs.cerit-sc.cz/en/docs/ai-as-a-service/ai-data-privacy).
 
 ```
@@ -184,8 +196,8 @@ and run `docker compose up -d` again.
 1. Create the resource from this repo and set **Build Pack** to **Docker Compose**
    (Docker Compose location: `/docker-compose.yml`). Nixpacks won't work: it only
    builds the bot and leaves out the Signal API container.
-2. Under **Environment Variables**, set `SIGNAL_NUMBER`, `LLM_API_KEY`, `DISCORD_TOKEN`
-   and `CAT_GEN_API_KEY`. Optionally set `DISCORD_GUILD_ID` to register Discord commands in one server.
+2. Under **Environment Variables**, set `SIGNAL_NUMBER`, `LLM_API_KEY`, `DISCORD_TOKEN`,
+   `CAT_GEN_API_KEY` and `GITHUB_TOKEN`. Optionally set `DISCORD_GUILD_ID` to register Discord commands in one server.
    Don't add a domain; these services use outbound connections.
    Don't add port mappings either. Coolify publishes them on all interfaces
    (it drops a `127.0.0.1:` prefix), which would expose the unauthenticated Signal API.

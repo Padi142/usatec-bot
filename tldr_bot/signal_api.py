@@ -5,7 +5,7 @@ import base64
 import json
 import logging
 from collections.abc import AsyncIterator
-from urllib.parse import parse_qs, quote as quote_path, urlsplit
+from urllib.parse import parse_qs, urlsplit
 from dataclasses import dataclass, field
 
 import httpx
@@ -31,6 +31,13 @@ class Sticker:
 
 
 @dataclass(frozen=True)
+class Attachment:
+    id: str  # what signal-cli saved it as, for GET /v1/attachments/{id}
+    content_type: str
+    size: int | None = None  # in bytes, when signal-cli reports it
+
+
+@dataclass(frozen=True)
 class Quote:
     """The message a reply quotes. Authors show up by UUID, number or both."""
     timestamp: int
@@ -49,9 +56,13 @@ class GroupMessage:
     # What the sender typed, without the quote and attachment markers `text` has.
     body: str | None = None
     sticker: Sticker | None = None
-    # The attachment id of the message's first image, for GET /v1/attachments/{id}.
-    image: str | None = None
+    attachments: tuple[Attachment, ...] = ()
     quote: Quote | None = None
+
+    @property
+    def image(self) -> Attachment | None:
+        """The first picture, which /sticker turns into a sticker."""
+        return next((a for a in self.attachments if a.content_type.startswith("image/")), None)
 
 
 @dataclass(frozen=True)
@@ -78,10 +89,6 @@ class GroupDelete:
 
 
 Event = GroupMessage | GroupEdit | GroupDelete | DirectMessage
-
-
-class AttachmentTooLarge(Exception):
-    pass
 
 
 def to_rest_group_id(internal_id: str) -> str:
@@ -118,11 +125,12 @@ def _sticker(data: dict) -> Sticker | None:
     return None
 
 
-def _image(data: dict) -> str | None:
-    for attachment in data.get("attachments") or []:
-        if str(attachment.get("contentType", "")).startswith("image/") and isinstance(attachment.get("id"), str):
-            return attachment["id"]
-    return None
+def _attachments(data: dict) -> tuple[Attachment, ...]:
+    return tuple(
+        Attachment(a["id"], a["contentType"].lower(), a.get("size") if isinstance(a.get("size"), int) else None)
+        for a in data.get("attachments") or []
+        if isinstance(a.get("id"), str) and isinstance(a.get("contentType"), str)
+    )
 
 
 def _quote(data: dict) -> Quote | None:
@@ -196,7 +204,7 @@ def parse_event(payload: dict) -> Event | None:
     timestamp = data.get("timestamp") or env.get("timestamp")
     return GroupMessage(
         group_id, sender_id, sender_name, sender_number, timestamp, text, _mentions(data), data.get("message"),
-        _sticker(data), _image(data), _quote(data),
+        _sticker(data), _attachments(data), _quote(data),
     )
 
 
@@ -284,20 +292,6 @@ class SignalClient:
         except (ValueError, KeyError, TypeError):
             return None
 
-    async def attachment(self, attachment_id: str, max_bytes: int) -> bytes:
-        """A received attachment, which signal-cli downloads as messages arrive.
-
-        Raises AttachmentTooLarge past max_bytes, without downloading the rest.
-        """
-        async with self._http.stream("GET", f"/v1/attachments/{quote_path(attachment_id, safe='')}") as resp:
-            resp.raise_for_status()
-            data = bytearray()
-            async for chunk in resp.aiter_bytes():
-                data += chunk
-                if len(data) > max_bytes:
-                    raise AttachmentTooLarge(f"Attachment {attachment_id} is over {max_bytes} bytes")
-            return bytes(data)
-
     async def install_sticker_pack(self, pack_id: str, pack_key: str) -> None:
         """Install a pack, so the account can send its stickers. signal-cli downloads it first."""
         resp = await self._http.post(
@@ -324,6 +318,20 @@ class SignalClient:
             },
         )
         resp.raise_for_status()
+
+    async def attachment(self, attachment_id: str, max_bytes: int) -> bytes | None:
+        """The contents of an attachment signal-cli has downloaded, or None if it's over max_bytes.
+
+        The download stops as soon as it passes max_bytes.
+        """
+        async with self._http.stream("GET", f"/v1/attachments/{attachment_id}") as resp:
+            resp.raise_for_status()
+            data = bytearray()
+            async for chunk in resp.aiter_bytes():
+                data += chunk
+                if len(data) > max_bytes:
+                    return None
+            return bytes(data)
 
     async def sticker_pack_key(self, pack_id: str) -> str | None:
         """The hex key of a sticker pack the account has seen, or None if it hasn't."""

@@ -5,11 +5,21 @@ import unicodedata
 from dataclasses import asdict, dataclass
 
 from .llm import Choice
+from .signal_api import Attachment
 
 MAX_RULES = 67
 MAX_TOPIC_CHARS = 200
 # Only the start of a long message is judged, which is plenty to find its topic.
 MAX_MESSAGE_CHARS = 2000
+
+# Pictures the vision model describes for the decision model. Signal sends GIFs as video.
+IMAGE_TYPES = frozenset({"image/jpeg", "image/png", "image/webp"})
+MAX_IMAGES = 4
+# Signal compresses photos well below this. Larger ones are skipped, not judged slowly.
+MAX_IMAGE_BYTES = 5_000_000
+# Downloading and describing a message's pictures together. Reactions run one at a time,
+# so a stuck download would hold up every other message.
+PICTURE_TIMEOUT = 30.0
 
 # Most messages should get no reaction, so the label for them can't be a rule's emoji.
 NO_REACTION = "none"
@@ -88,6 +98,22 @@ def with_rule(rules: tuple[ReactionRule, ...], rule: ReactionRule) -> tuple[Reac
 
 def without_rule(rules: tuple[ReactionRule, ...], emoji: str) -> tuple[ReactionRule, ...]:
     return tuple(r for r in rules if not same_emoji(r.emoji, emoji))
+
+
+def judged_images(attachments: tuple[Attachment, ...]) -> tuple[Attachment, ...]:
+    """The attachments that get described: the first few pictures of a readable type and size."""
+    return tuple(
+        a for a in attachments
+        if a.content_type in IMAGE_TYPES and (a.size is None or a.size <= MAX_IMAGE_BYTES)
+    )[:MAX_IMAGES]
+
+
+def judged_state(text: str | None, description: str | None) -> str | None:
+    """What the decision model reads: the message's text, then what its pictures show."""
+    parts = [text] if text else []
+    if description:
+        parts.append(f"[picture: {description}]")
+    return "\n".join(parts) or None
 
 
 def build_criteria(rules: tuple[ReactionRule, ...]) -> dict[str, str]:

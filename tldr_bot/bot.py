@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import re
+import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
@@ -10,12 +11,25 @@ import httpx
 
 from .cats import GRID_LAYOUTS, CatClient, CatError, CatGenClient
 from .config import Config
+from .features import (
+    COOLDOWN_SECONDS,
+    FEATURE_LABEL,
+    MAX_REQUEST_CHARS,
+    FeatureCommand,
+    GitHubError,
+    GitHubIssues,
+    issue_body,
+    issue_title,
+    parse_feature_command,
+)
 from .llm import LLMClient, LLMError, ModelInfo
 from .reactions import (
     INSTRUCTIONS,
+    MAX_IMAGE_BYTES,
     MAX_MESSAGE_CHARS,
     MAX_RULES,
     MAX_TOPIC_CHARS,
+    PICTURE_TIMEOUT,
     ReactAdd,
     ReactCommand,
     ReactRemove,
@@ -24,6 +38,8 @@ from .reactions import (
     build_criteria,
     dump_rules,
     is_emoji,
+    judged_images,
+    judged_state,
     load_rules,
     parse_react_command,
     pick_rule,
@@ -36,7 +52,6 @@ from .signal_api import (
     GroupDelete,
     GroupEdit,
     GroupMessage,
-    AttachmentTooLarge,
     SignalClient,
     Sticker,
     parse_event,
@@ -289,6 +304,7 @@ class TldrBot:
         cats: CatClient,
         cat_gen: CatGenClient | None = None,
         stickers: StickerEmojis | None = None,  # None means stickers get no reactions
+        issues: GitHubIssues | None = None,  # None means /feature is disabled
         sticker_packs: StickerPackUploader | None = None,  # None means /sticker is disabled
     ):
         self.cfg = cfg
@@ -298,6 +314,8 @@ class TldrBot:
         self.cats = cats
         self.cat_gen = cat_gen
         self.stickers = stickers
+        self.issues = issues
+        self._last_feature: dict[str, float] = {}  # sender id -> monotonic time of their last /feature
         self.sticker_packs = sticker_packs
         self._tasks: set[asyncio.Task] = set()
         # Pack edits read the pack and upload a new one, so they take turns.
@@ -353,6 +371,11 @@ class TldrBot:
             )) is not None:
                 log.info("/sticker from %s in group %s", event.sender_name, event.group_id)
                 self._spawn(self.run_sticker(event, sticker_command))
+            case GroupMessage() if (feature_command := parse_feature_command(
+                render_mentions(event.body or "", event.mentions, self.store.display_name)
+            )) is not None:
+                log.info("/feature from %s in group %s", event.sender_name, event.group_id)
+                self._spawn(self.run_feature(event, feature_command))
             case GroupMessage() if (react_command := parse_react_command(event.text)) is not None:
                 log.info("/react from %s in group %s", event.sender_name, event.group_id)
                 self._spawn(self.run_react_command(event, react_command))
@@ -364,7 +387,7 @@ class TldrBot:
                         ChatMessage(event.group_id, event.sender_id, event.sender_name, event.timestamp, text)
                     )
                     if event.image:
-                        self.store.add_image(event.group_id, event.sender_id, event.timestamp, event.image)
+                        self.store.add_image(event.group_id, event.sender_id, event.timestamp, event.image.id)
                     self._queue_reaction(event)
                 else:
                     log.info("/tldr from %s in group %s", event.sender_name, event.group_id)
@@ -449,6 +472,42 @@ class TldrBot:
         except Exception:
             log.exception("/mackagen failed")
 
+    async def run_feature(self, msg: GroupMessage, command: FeatureCommand) -> None:
+        try:
+            await self.reply(msg, await self._file_feature(msg, command))
+        except Exception:
+            log.exception("/feature failed")
+
+    async def _file_feature(self, msg: GroupMessage, command: FeatureCommand) -> str:
+        """File the request as a GitHub issue and return what to tell the sender."""
+        if self.issues is None:
+            return "Feature requests aren't set up (GITHUB_TOKEN is missing)."
+        if command.request is None:
+            return "Usage: /feature <what the bot should do>\nI'll save it for the next build session."
+        if len(command.request) > MAX_REQUEST_CHARS:
+            return f"That request is too long, the limit is {MAX_REQUEST_CHARS} characters."
+        # No await between the check and the update, so a burst can't slip through.
+        now = time.monotonic()
+        last = self._last_feature.get(msg.sender_id)
+        if last is not None and now - last < COOLDOWN_SECONDS:
+            return f"You can send one request every {COOLDOWN_SECONDS // 60} minutes, try again later."
+        self._last_feature[msg.sender_id] = now
+        try:
+            issue = await self.issues.create(
+                issue_title(command.request), issue_body(command.request, msg.sender_name), [FEATURE_LABEL]
+            )
+        except GitHubError as e:
+            # It may have been saved anyway, for example when only the response timed out.
+            log.error("Filing a feature request failed: %s", e)
+            return (
+                "Sorry, I couldn't confirm that your request was saved. "
+                f"Check the open requests before sending it again:\n{self.issues.requests_url}"
+            )
+        if FEATURE_LABEL not in issue.labels:
+            log.error("Issue #%d was created without the %s label", issue.number, FEATURE_LABEL)
+            return f"Saved as #{issue.number}, but without its label, so tell the maintainer.\n{issue.url}"
+        return f"Saved as #{issue.number} for the next build session to review. It's public.\n{issue.url}"
+
     def _sticker_usage(self) -> str:
         pack, count = self.store.sticker_pack(), self.store.sticker_count()
         if pack is None:
@@ -491,12 +550,9 @@ class TldrBot:
             async with self._sticker_lock:
                 if self.store.sticker_count() >= MAX_STICKERS:
                     return f"The pack is full, it has {MAX_STICKERS} stickers. /sticker remove <n> makes room."
-                try:
-                    image = await self._sticker_source(msg)
-                except AttachmentTooLarge:
-                    return "That image is too big for a sticker."
-                if image is None:
-                    return "I can't find that image. I only know images sent while I'm running."
+                image = await self._sticker_source(msg)
+                if isinstance(image, str):
+                    return image
                 try:
                     sticker = NewSticker(await asyncio.to_thread(make_sticker, image), emoji or DEFAULT_EMOJI)
                 except StickerError as e:
@@ -518,20 +574,22 @@ class TldrBot:
             log.warning("Sending the new sticker failed: %s", e)
             return f"Added as sticker {position + 1}:\n{pack.url}"
 
-    async def _sticker_source(self, msg: GroupMessage) -> bytes | None:
-        """The image a /sticker message is about: its own image, or the one it replies to."""
-        attachment_id = msg.image
+    async def _sticker_source(self, msg: GroupMessage) -> bytes | str:
+        """The image a /sticker message is about, its own or the one it replies to, or why there's none."""
+        missing = "I can't find that image. I only know images sent while I'm running."
+        attachment_id = msg.image.id if msg.image else None
         if attachment_id is None and msg.quote is not None:
             if (own := self._own_images.get((msg.group_id, msg.quote.timestamp))) is not None:
                 return own
             attachment_id = self.store.image(msg.group_id, msg.quote.author_ids, msg.quote.timestamp)
         if attachment_id is None:
-            return None
+            return missing
         try:
-            return await self.signal.attachment(attachment_id, MAX_STICKER_SOURCE_BYTES)
+            image = await self.signal.attachment(attachment_id, MAX_STICKER_SOURCE_BYTES)
         except httpx.HTTPError as e:
             log.warning("Image download failed: %s", e)
-            return None
+            return missing
+        return "That image is too big for a sticker." if image is None else image
 
     async def _remove_sticker(self, position: int) -> str:
         assert self.sticker_packs is not None
@@ -552,8 +610,12 @@ class TldrBot:
         return load_rules(self.store.setting(REACTION_RULES_SETTING))
 
     def _queue_reaction(self, msg: GroupMessage) -> None:
-        # Bare attachments have nothing to judge.
-        judgeable = bool(msg.body) or (msg.sticker is not None and self.stickers is not None)
+        # Other attachments, like files and videos, have nothing to judge.
+        judgeable = (
+            bool(msg.body)
+            or bool(judged_images(msg.attachments))
+            or (msg.sticker is not None and self.stickers is not None)
+        )
         if not judgeable or not self.reaction_rules:
             return
         if self._pending_reactions >= MAX_PENDING_REACTIONS:
@@ -574,7 +636,7 @@ class TldrBot:
     async def _react(self, msg: GroupMessage) -> None:
         """React if the message matches a rule. A failure only costs the reaction, the chat sees nothing."""
         rules = self.reaction_rules
-        state = await self._judged_content(msg)
+        state = judged_state(await self._judged_text(msg), await self._picture_description(msg))
         if not state:
             return
         try:
@@ -588,8 +650,33 @@ class TldrBot:
                 msg.group_id, rule.emoji, msg.sender_number or msg.sender_id, msg.timestamp,
             )
 
-    async def _judged_content(self, msg: GroupMessage) -> str | None:
-        """What the decision model sees: the typed text, or a sticker's emoji on its own."""
+    async def _picture_description(self, msg: GroupMessage) -> str | None:
+        """What the message's pictures show, or None without pictures or when that fails."""
+        try:
+            async with asyncio.timeout(PICTURE_TIMEOUT):
+                images = await self._download_pictures(msg)
+                return await self.llm.describe_images(images, self.cfg.vision_model) if images else None
+        except TimeoutError:
+            log.warning("Picture description took over %ss", PICTURE_TIMEOUT)
+        except LLMError as e:
+            log.warning("Picture description failed: %s", e)
+        return None
+
+    async def _download_pictures(self, msg: GroupMessage) -> list[tuple[str, bytes]]:
+        """The pictures to describe, as (content type, data). Failed and oversized ones are left out."""
+        images: list[tuple[str, bytes]] = []
+        for attachment in judged_images(msg.attachments):
+            try:
+                data = await self.signal.attachment(attachment.id, MAX_IMAGE_BYTES)
+            except httpx.HTTPError as e:
+                log.warning("Attachment download failed: %s", e)
+                continue
+            if data is not None:
+                images.append((attachment.content_type, data))
+        return images
+
+    async def _judged_text(self, msg: GroupMessage) -> str | None:
+        """What the decision model reads: the typed text, or a sticker's emoji on its own."""
         if msg.body:
             return render_mentions(msg.body, msg.mentions, self.store.display_name)[:MAX_MESSAGE_CHARS]
         if msg.sticker is None or self.stickers is None:

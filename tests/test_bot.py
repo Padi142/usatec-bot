@@ -11,6 +11,7 @@ import pytest
 from PIL import Image
 
 from tldr_bot.bot import (
+    MAX_STICKER_SOURCE_BYTES,
     LOCAL_TZ,
     MAX_PENDING_REACTIONS,
     TldrBot,
@@ -28,12 +29,25 @@ from tldr_bot.bot import (
     format_models,
     resolve_since_time,
 )
+from tldr_bot import bot as bot_module
 from tldr_bot.cats import CatClient, CatError, CatGenClient
 from tldr_bot.config import Config, normalize_group_id
+from tldr_bot.features import (
+    MAX_TITLE_CHARS,
+    FeatureCommand,
+    GitHubError,
+    GitHubIssues,
+    Issue,
+    issue_body,
+    issue_title,
+    parse_feature_command,
+)
 from tldr_bot.health import heartbeat, is_healthy
 from tldr_bot.llm import STATUS_URL, Choice, LLMClient, LLMError, ModelInfo
 from tldr_bot.reactions import (
     DEFAULT_RULES,
+    MAX_IMAGE_BYTES,
+    MAX_IMAGES,
     MAX_TOPIC_CHARS,
     MIN_CONFIDENCE,
     ReactAdd,
@@ -67,7 +81,7 @@ from tldr_bot.stickers import (
 )
 from tldr_bot import stickers as stickers_module
 from tldr_bot.signal_api import (
-    AttachmentTooLarge,
+    Attachment,
     DirectMessage,
     Sticker,
     GroupDelete,
@@ -288,6 +302,16 @@ def test_attachment_and_quote():
     assert ev.text == '(replying to "pizza tonight?") yes'
 
 
+def test_parse_attachments():
+    attachments = [
+        {"id": "a.jpg", "contentType": "IMAGE/JPEG", "size": 10},
+        {"id": "b.mp4", "contentType": "video/mp4"},
+        {"contentType": "image/png"},  # nothing to download it by
+    ]
+    ev = parse_event(envelope(group_data(None, attachments=attachments)))
+    assert ev.attachments == (Attachment("a.jpg", "image/jpeg", 10), Attachment("b.mp4", "video/mp4"))
+
+
 def test_parse_edit_and_delete():
     ev = parse_event(envelope(edit={"targetSentTimestamp": 5, "dataMessage": group_data("fixed")}))
     assert ev == GroupEdit(GROUP, "uuid-alice", 5, "fixed", [])
@@ -419,6 +443,26 @@ async def test_llm_choose():
     llm._http._transport = httpx.MockTransport(lambda r: httpx.Response(200, json={"answers": {}}))
     with pytest.raises(LLMError):
         await llm.choose("hi", "Which?", {"a": "A"}, "d3")
+
+
+async def test_llm_describe_images():
+    def handler(request: httpx.Request):
+        body = json.loads(request.content)
+        assert body["model"] == "gemma4" and body["temperature"] == 0
+        text, image = body["messages"][0]["content"]
+        assert text["type"] == "text"
+        assert image == {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,SlBFRw=="}}
+        return httpx.Response(200, json={"choices": [{"message": {"content": "A black cat."}}]})
+
+    llm = LLMClient("http://llm/v1", None, 10)
+    llm._http._transport = httpx.MockTransport(handler)
+    assert await llm.describe_images([("image/jpeg", b"JPEG")], "gemma4") == "A black cat."
+
+    llm._http._transport = httpx.MockTransport(
+        lambda r: httpx.Response(200, json={"choices": [{"message": {"content": [{"type": "text"}]}}]})
+    )
+    with pytest.raises(LLMError):
+        await llm.describe_images([("image/jpeg", b"JPEG")], "gemma4")
 
 
 async def test_llm_summarize_strips_think():
@@ -600,6 +644,15 @@ class FakeSignal:
         self.sent = []
         self.direct = []
         self.reactions = []
+        self.files = {}  # attachment id -> contents; others fail to download
+
+    async def attachment(self, attachment_id, max_bytes):
+        if attachment_id not in self.files:
+            raise httpx.HTTPStatusError("missing", request=httpx.Request("GET", "http://x"), response=httpx.Response(404))
+        data = self.files[attachment_id]
+        if isinstance(data, asyncio.Event):  # a download that hangs until it's set
+            await data.wait()
+        return data if len(data) <= max_bytes else None
 
     async def send_direct(self, recipient, text):
         self.direct.append((recipient, text))
@@ -639,6 +692,8 @@ class FakeLLM:
         self.transcripts = []
         self.models = []
         self.decisions = []
+        self.described = []  # the images of each description request
+        self.description = "A black cat."
         self.prompts = []
         self.prompt_error = None
         self.reaction_choice = Choice("none", 0.99)
@@ -648,6 +703,12 @@ class FakeLLM:
         if self.prompt_error:
             raise self.prompt_error
         return "the answer"
+
+    async def describe_images(self, images, model):
+        self.described.append(list(images))
+        if isinstance(self.description, Exception):
+            raise self.description
+        return self.description
 
     async def choose(self, state, instructions, criteria, model):
         self.decisions.append((state, criteria, model))
@@ -998,6 +1059,88 @@ async def test_sticker_emojis_download_each_pack_once(monkeypatch):
 
     with pytest.raises(StickerError, match="doesn't know the key"):
         await StickerEmojis(FakePackKeys(missing_for=2)).emoji(Sticker("0000", 1))
+
+
+def photo(attachment_id, content_type="image/jpeg", size=None):
+    return {"id": attachment_id, "contentType": content_type, "size": size}
+
+
+async def test_pictures_are_judged_by_their_description():
+    bot = make_bot()
+    bot.signal.files = {"cat.jpg": b"JPEG", "dog.png": b"PNG"}
+    bot.llm.reaction_choice = Choice("🐈", 0.9)
+    bot.handle(envelope(group_data(None, ts=5, attachments=[photo("cat.jpg")])))
+    bot.handle(envelope(group_data("look", ts=6, attachments=[photo("dog.png", "image/png")])))
+    await finish_tasks(bot)
+
+    assert bot.llm.described == [[("image/jpeg", b"JPEG")], [("image/png", b"PNG")]]
+    assert [state for state, _, _ in bot.llm.decisions] == [
+        "[picture: A black cat.]", "look\n[picture: A black cat.]",
+    ]
+    assert bot.signal.reactions == [(GROUP, "🐈", "+420111", 5), (GROUP, "🐈", "+420111", 6)]
+
+
+async def test_only_the_first_few_readable_pictures_are_described():
+    bot = make_bot()
+    bot.signal.files = {f"{i}.jpg": b"JPEG" for i in range(MAX_IMAGES + 1)} | {"big.jpg": bytes(MAX_IMAGE_BYTES + 1)}
+    attachments = [
+        photo("clip.mp4", "video/mp4"),
+        photo("huge.jpg", size=MAX_IMAGE_BYTES + 1),
+        photo("big.jpg"),  # bigger than its reported size
+        photo("gone.jpg"),
+        *(photo(f"{i}.jpg") for i in range(MAX_IMAGES + 1)),
+    ]
+    bot.handle(envelope(group_data(None, ts=5, attachments=attachments)))
+    await finish_tasks(bot)
+    # big.jpg and gone.jpg take two of the slots, then fail.
+    assert bot.llm.described == [[("image/jpeg", b"JPEG")] * (MAX_IMAGES - 2)]
+
+
+@pytest.mark.parametrize("attachment", [photo("clip.mp4", "video/mp4"), photo("gone.jpg")])
+async def test_attachment_without_a_readable_picture_gets_no_decision(attachment):
+    bot = make_bot()
+    bot.handle(envelope(group_data(None, ts=5, attachments=[attachment])))
+    await finish_tasks(bot)
+    assert bot.llm.described == [] and bot.llm.decisions == []
+
+
+async def test_failed_description_leaves_only_the_text():
+    bot = make_bot()
+    bot.signal.files = {"cat.jpg": b"JPEG"}
+    bot.llm.description = LLMError("down")
+    bot.handle(envelope(group_data(None, ts=5, attachments=[photo("cat.jpg")])))
+    bot.handle(envelope(group_data("look", ts=6, attachments=[photo("cat.jpg")])))
+    await finish_tasks(bot)
+    assert [state for state, _, _ in bot.llm.decisions] == ["look"]
+
+
+async def test_slow_pictures_leave_only_the_text(monkeypatch):
+    monkeypatch.setattr(bot_module, "PICTURE_TIMEOUT", 0.01)
+    bot = make_bot()
+    bot.signal.files = {"slow.jpg": asyncio.Event()}
+    bot.handle(envelope(group_data("look", ts=5, attachments=[photo("slow.jpg")])))
+    await finish_tasks(bot)
+    assert bot.llm.described == [] and [state for state, _, _ in bot.llm.decisions] == ["look"]
+
+
+async def test_download_attachment_stops_past_the_limit():
+    chunks_read = 0
+
+    async def body():
+        nonlocal chunks_read
+        for _ in range(10):
+            chunks_read += 1
+            yield b"x" * 100
+
+    def handler(request: httpx.Request):
+        assert request.url.path.startswith("/v1/attachments/")
+        return httpx.Response(200, content=body() if request.url.path.endswith("big.jpg") else b"JPEG")
+
+    signal = SignalClient("http://signal", "+420999")
+    signal._http._transport = httpx.MockTransport(handler)
+    assert await signal.attachment("cat.jpg", 4) == b"JPEG"
+    assert await signal.attachment("big.jpg", 250) is None
+    assert chunks_read == 3
 
 
 class FakeStickers:
@@ -1359,6 +1502,99 @@ def test_stale_heartbeat(tmp_path):
     assert not is_healthy(path)
 
 
+# --- /feature -----------------------------------------------------------------
+
+@pytest.mark.parametrize("text, expected", [
+    ("/feature", FeatureCommand()),
+    ("/FEATURE  add a /weather command ", FeatureCommand(request="add a /weather command")),
+    ("/feature line one\nline two", FeatureCommand(request="line one\nline two")),
+    ("/features please", None),
+])
+def test_parse_feature_command(text, expected):
+    assert parse_feature_command(text) == expected
+
+
+def test_issue_title_uses_the_first_line_cut_at_a_word():
+    assert issue_title("Add  weather\nwith details") == "Add weather"
+    long = issue_title("word " * 40)
+    assert len(long) <= MAX_TITLE_CHARS and long.endswith("word…")
+
+
+async def test_github_issue_request():
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request):
+        requests.append(request)
+        return httpx.Response(201, json={
+            "number": 7, "html_url": "https://github.com/o/r/issues/7", "labels": [{"name": "feature-request"}],
+        })
+
+    issues = GitHubIssues("tok", "o/r")
+    issues._http._transport = httpx.MockTransport(handler)
+    issue = await issues.create("t", "b", ["feature-request"])
+    assert issue == Issue(7, "https://github.com/o/r/issues/7", frozenset({"feature-request"}))
+    assert requests[0].url.path == "/repos/o/r/issues"
+    assert requests[0].headers["authorization"] == "Bearer tok"
+    assert json.loads(requests[0].content) == {"title": "t", "body": "b", "labels": ["feature-request"]}
+
+
+class FakeIssues:
+    requests_url = "https://github.com/o/r/issues?q=label%3Afeature-request"
+
+    def __init__(self, error=None, keeps_labels=True):
+        self.created = []
+        self.error = error
+        self.keeps_labels = keeps_labels
+
+    async def create(self, title, body, labels):
+        if self.error:
+            raise self.error
+        self.created.append((title, body, labels))
+        n = len(self.created)
+        return Issue(n, f"https://github.com/o/r/issues/{n}", frozenset(labels if self.keeps_labels else ()))
+
+
+async def test_feature_files_a_labeled_issue_with_only_the_display_name():
+    bot = make_bot()
+    bot.issues = FakeIssues()
+    reply = await send_command(bot, "/feature add a /weather command", 1)
+    assert reply.startswith("Saved as #1") and "issues/1" in reply
+    [(title, body, labels)] = bot.issues.created
+    assert title == "add a /weather command" and labels == ["feature-request"]
+    assert "by Alice" in body and "uuid-alice" not in body
+    # Commands aren't chat: not summarized, and no reaction.
+    assert bot.store.last_before(GROUP, 100, 100) == [] and bot.llm.decisions == []
+
+
+@pytest.mark.parametrize("issues, text, expected", [
+    (None, "/feature x", "aren't set up"),
+    (FakeIssues(), "/feature", "Usage"),
+    (FakeIssues(), "/feature " + "x" * 2001, "too long"),
+    (FakeIssues(GitHubError("timed out")), "/feature x", "Check the open requests"),
+    (FakeIssues(keeps_labels=False), "/feature x", "without its label"),
+])
+async def test_feature_failures_are_explained(issues, text, expected):
+    bot = make_bot()
+    bot.issues = issues
+    assert expected in await send_command(bot, text, 1)
+
+
+def test_issue_text_hides_phone_numbers_and_github_mentions():
+    body = issue_body("ping @padi142, call +420 123 456 789 or 123-456-789", "+420123456789")
+    assert "123" not in body and body.count("[number]") == 3
+    assert "@padi142" not in body and "@\u200bpadi142" in body
+    # Short numbers in a request are fine.
+    assert "/mackagen 3x3 for 25 cats" in issue_body("/mackagen 3x3 for 25 cats", "Alice")
+
+
+async def test_feature_requests_have_a_per_sender_cooldown():
+    bot = make_bot()
+    bot.issues = FakeIssues()
+    assert "Saved as #1" in await send_command(bot, "/feature one", 1)
+    assert "try again later" in await send_command(bot, "/feature two", 2)
+    assert len(bot.issues.created) == 1
+
+
 # --- /sticker -----------------------------------------------------------------
 
 def png(width=40, height=20, color=(255, 0, 0, 255)) -> bytes:
@@ -1387,7 +1623,7 @@ def test_parse_image_and_quote():
         quote={"id": 7, "authorUuid": "uuid-bob", "authorNumber": "+420222", "text": ""},
     )
     ev = parse_event(envelope(data))
-    assert ev.image == "a.jpg" and ev.quote == Quote(7, ("uuid-bob", "+420222"))
+    assert ev.image.id == "a.jpg" and ev.quote == Quote(7, ("uuid-bob", "+420222"))
     assert parse_event(envelope(group_data("hi"))).quote is None
 
 
@@ -1505,13 +1741,8 @@ class FakePacks:
 class StickerSignal(FakeSignal):
     def __init__(self):
         super().__init__()
-        self.attachments = {"a.jpg": png()}
+        self.files["a.jpg"] = png()
         self.installed = []
-
-    async def attachment(self, attachment_id, max_bytes):
-        if attachment_id not in self.attachments:
-            raise httpx.HTTPStatusError("missing", request=httpx.Request("GET", "http://x"), response=httpx.Response(404))
-        return self.attachments[attachment_id]
 
     async def install_sticker_pack(self, pack_id, pack_key):
         self.installed.append(pack_id)
@@ -1555,7 +1786,7 @@ async def test_sticker_from_an_image_with_the_command_as_caption_and_from_the_bo
     bot.cats.random_cat = lambda: asyncio.sleep(0, ("image/png", png()))
     await send_command(bot, "/macka", 2)
     cat_ts = 10_000 + len(bot.signal.sent)
-    bot.signal.attachments.clear()
+    bot.signal.files.clear()
     bot.handle(reply_to("/sticker 🐈", 3, cat_ts, author="uuid-bot"))
     await finish_tasks(bot)
     assert [s.emoji for s in bot.sticker_packs.uploads[-1]] == [DEFAULT_EMOJI, "🐈"]
@@ -1596,7 +1827,12 @@ async def test_sticker_explains_what_went_wrong():
     await finish_tasks(bot)
     assert "can't find that image" in bot.signal.sent[-1][1]
 
-    bot.signal.attachments["bad"] = b"not an image"
+    bot.signal.files["huge"] = b"x" * (MAX_STICKER_SOURCE_BYTES + 1)
+    bot.handle(envelope(group_data("/sticker", ts=5, attachments=[{"contentType": "image/png", "id": "huge"}])))
+    await finish_tasks(bot)
+    assert "too big" in bot.signal.sent[-1][1]
+
+    bot.signal.files["bad"] = b"not an image"
     bot.handle(envelope(group_data("/sticker", ts=3, attachments=[{"contentType": "image/png", "id": "bad"}])))
     await finish_tasks(bot)
     assert "couldn't turn that into a sticker" in bot.signal.sent[-1][1]
@@ -1617,14 +1853,6 @@ async def test_send_group_returns_the_string_timestamp():
     signal = SignalClient("http://signal", "+420999")
     signal._http._transport = httpx.MockTransport(lambda request: httpx.Response(201, json={"timestamp": "1700000000123"}))
     assert await signal.send_group(GROUP, "hi") == 1700000000123
-
-
-async def test_attachment_download_stops_past_the_limit():
-    signal = SignalClient("http://signal", "+420999")
-    signal._http._transport = httpx.MockTransport(lambda request: httpx.Response(200, content=b"x" * 100))
-    assert await signal.attachment("a.jpg", 100) == b"x" * 100
-    with pytest.raises(AttachmentTooLarge):
-        await signal.attachment("a.jpg", 99)
 
 
 async def test_the_bots_own_images_only_work_in_their_group():
