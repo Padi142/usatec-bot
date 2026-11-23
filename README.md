@@ -34,11 +34,12 @@ The rules can be changed in a group, or in a direct message to the bot:
 
 - `/react` — show the rules,
 - `/react add <emoji> <topic>` — add a rule, or add words to the topic that emoji already has (remove it first to replace the topic),
-- `/react remove <emoji>` — remove a rule (with no rules left, the bot stops calling the model).
+- `/react remove <emoji>` — remove a rule (with no rules left, the bot stops asking the decision model, but photos are still described for `/tldr`).
 
 Pictures get reactions too, so a cat photo gets 🐈 even without a caption. A vision model
 (`VISION_MODEL`, by default `gemma4`) describes up to 4 photos of a message (JPEG, PNG or WebP,
-up to 5 MB each) in a sentence, and the decision model judges that together with the text.
+up to 5 MB each), including any readable text in screenshots. That description is saved with the
+message for `/tldr` summaries, and the decision model judges it together with the text.
 d3-flash reads images itself, but e-INFRA's gateway drops them. Videos, GIFs and files aren't judged.
 
 Stickers get reactions too, judged by the emoji their pack gives them: a 😴 sticker gets 🛏️.
@@ -95,12 +96,13 @@ summarizes from there. As a result:
 
 - it can only summarize messages sent **after** it joined the group,
 - it has to keep running to keep collecting messages,
+- pictures are described by the vision model (including text in screenshots), and those descriptions are saved with the messages and included in what gets summarized,
 - deleted messages are removed from the database, and edited ones are updated,
 - only the newest `HISTORY_LIMIT` messages per group are kept (default 5000).
 
 It's a good idea to tell the group that a bot is storing their messages and
 sending them to e-INFRA CZ: for summarization when someone asks, and each new
-message as it arrives, photos included, to pick a reaction. See e-INFRA's
+message as it arrives, photos included, to describe pictures and pick a reaction. See e-INFRA's
 [data privacy notes](https://docs.cerit-sc.cz/en/docs/ai-as-a-service/ai-data-privacy).
 
 ```

@@ -84,7 +84,7 @@ class Config:
     cat_gen_api_key: str | None = None
     # Judges every group message. This has to be a decision model, not a chat model.
     reaction_model: str = "vllm-sr-d3-flash"
-    # Describes pictures for the reaction model, which can't be sent them. Has to read images.
+    # Describes pictures for /tldr summaries and the reaction model. Has to read images.
     vision_model: str = "gemma4"
     # /feature files GitHub issues here. Without a token, /feature is disabled.
     github_token: str | None = None

@@ -48,10 +48,11 @@ Rules:
 """
 
 DESCRIBE_PROMPT = (
-    "Describe what these pictures from a group chat show, in one short sentence. "
-    "Name the main subjects, like animals, food, drinks, vehicles or people, and what they are doing."
+    "Briefly describe what these pictures from a group chat show, naming the main subjects "
+    "(like animals, food, drinks, vehicles or people) and what they are doing. "
+    "Transcribe any readable text in the pictures, such as in a screenshot."
 )
-DESCRIPTION_TOKENS = 80
+DESCRIPTION_TOKENS = 300
 
 _THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
 
@@ -187,10 +188,11 @@ class LLMClient:
         return await self._chat(model, [{"role": "user", "content": text}])
 
     async def describe_images(self, images: Sequence[tuple[str, bytes]], model: str) -> str:
-        """A short description of pictures, given as (content type, data), from a vision chat model.
+        """A description of pictures, given as (content type, data), from a vision chat model.
 
-        The decision model reads this instead of the pictures, because e-INFRA's gateway
-        drops the images that /systemone requests carry.
+        Stored with the message so /tldr summaries include what pictures and screenshots
+        show, and passed to the decision model because e-INFRA's gateway drops images on
+        /systemone requests.
         """
         content: list[dict] = [{"type": "text", "text": DESCRIBE_PROMPT}] + [
             {"type": "image_url", "image_url": {"url": f"data:{content_type};base64,{base64.b64encode(data).decode()}"}}
