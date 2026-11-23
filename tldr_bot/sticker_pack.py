@@ -15,12 +15,13 @@ import re
 import ssl
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Protocol
 
 import httpx
 from PIL import Image, ImageOps
 
 from .stickers import SIGNAL_CA, SIGNAL_CDN, StickerError, build_manifest, encrypt
-from .store import PackSticker
+from .store import PackRef
 
 SIGNAL_SERVICE = "https://chat.signal.org"
 PACK_TITLE = "Usatec stickers"
@@ -31,6 +32,9 @@ MAX_STICKERS = 200
 MAX_STICKER_BYTES = 300 * 1024
 STICKER_SIZE = 512
 STICKER_CONTENT_TYPE = "image/webp"
+# Bigger images are refused before decoding, to bound the memory a sticker costs.
+# JPEGs are decoded at a reduced size first, so this mostly limits PNGs and the like.
+MAX_IMAGE_PIXELS = 25_000_000
 # Uploads to the CDN that run at once.
 UPLOAD_CONCURRENCY = 8
 
@@ -80,6 +84,11 @@ def make_sticker(image: bytes) -> bytes:
     """Fit an image into a transparent 512x512 WebP under Signal's size limit. Raises StickerError."""
     try:
         with Image.open(io.BytesIO(image)) as img:
+            # Image.open only reads the header, so nothing big is decoded yet.
+            img.draft("RGB", (STICKER_SIZE, STICKER_SIZE))
+            if img.width * img.height > MAX_IMAGE_PIXELS:
+                raise StickerError(f"The image is too big: {img.width}x{img.height}")
+            img.thumbnail((STICKER_SIZE, STICKER_SIZE))
             # Phone photos are often stored sideways with an EXIF note to rotate them.
             frame = ImageOps.contain(ImageOps.exif_transpose(img).convert("RGBA"), (STICKER_SIZE, STICKER_SIZE))
     except (OSError, ValueError, Image.DecompressionBombError) as e:
@@ -94,14 +103,20 @@ def make_sticker(image: bytes) -> bytes:
     raise StickerError("The sticker doesn't fit in Signal's size limit")
 
 
-@dataclass(frozen=True)
-class PackRef:
-    pack_id: str  # hex
-    pack_key: str  # hex
+class StickerImage(Protocol):
+    """A sticker to upload: a stored PackSticker, or a NewSticker that isn't saved yet."""
 
     @property
-    def url(self) -> str:
-        return f"https://signal.art/addstickers/#pack_id={self.pack_id}&pack_key={self.pack_key}"
+    def image(self) -> bytes: ...
+
+    @property
+    def emoji(self) -> str: ...
+
+
+@dataclass(frozen=True)
+class NewSticker:
+    image: bytes
+    emoji: str
 
 
 class StickerUploadError(StickerError):
@@ -151,7 +166,7 @@ class StickerPackUploader:
         await self._service.aclose()
         await self._cdn.aclose()
 
-    async def upload(self, stickers: list[PackSticker]) -> PackRef:
+    async def upload(self, stickers: list[StickerImage]) -> PackRef:
         """Upload a pack with these stickers. The first is also the cover. Raises StickerUploadError."""
         if not 1 <= len(stickers) <= MAX_STICKERS:
             raise StickerUploadError(f"A pack needs 1 to {MAX_STICKERS} stickers, not {len(stickers)}")
@@ -169,20 +184,29 @@ class StickerPackUploader:
             if not re.fullmatch(r"[0-9a-f]{32}", pack_id) or ids != list(range(len(stickers))):
                 raise StickerUploadError("Signal sent an unexpected upload form")
             manifest = build_manifest(PACK_TITLE, PACK_AUTHOR, [s.emoji for s in stickers], STICKER_CONTENT_TYPE)
-            slots = asyncio.Semaphore(UPLOAD_CONCURRENCY)
-
-            async def put(upload_form: dict, data: bytes) -> None:
-                async with slots:
-                    await self._put(upload_form, encrypt(data, pack_key))
-
-            await put(manifest_form, manifest)
             # Each form names its sticker id, which is the sticker's place in the manifest.
-            await asyncio.gather(*(put(f, stickers[int(f["id"])].image) for f in sticker_forms))
+            files = [(manifest_form, manifest)] + [(f, stickers[int(f["id"])].image) for f in sticker_forms]
+            await self._put_all(files, pack_key)
         except httpx.HTTPError as e:
             raise StickerUploadError(f"Sticker pack upload failed: {type(e).__name__}: {e}") from e
         except (ValueError, KeyError, TypeError) as e:
             raise StickerUploadError(f"Signal sent an unexpected upload form: {type(e).__name__}: {e}") from e
         return PackRef(pack_id, pack_key.hex())
+
+    async def _put_all(self, files: list[tuple[dict, bytes]], pack_key: bytes) -> None:
+        """Encrypt and upload files a few at a time. The first failure cancels the rest and is raised."""
+        slots = asyncio.Semaphore(UPLOAD_CONCURRENCY)
+
+        async def put(upload_form: dict, data: bytes) -> None:
+            async with slots:
+                await self._put(upload_form, encrypt(data, pack_key))
+
+        try:
+            async with asyncio.TaskGroup() as uploads:
+                for upload_form, data in files:
+                    uploads.create_task(put(upload_form, data))
+        except ExceptionGroup as group:
+            raise group.exceptions[0] from None
 
     async def _put(self, upload_form: dict, data: bytes) -> None:
         """POST a file to the CDN with the signed S3 form Signal handed out for it."""

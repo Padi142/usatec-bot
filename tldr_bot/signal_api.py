@@ -80,6 +80,10 @@ class GroupDelete:
 Event = GroupMessage | GroupEdit | GroupDelete | DirectMessage
 
 
+class AttachmentTooLarge(Exception):
+    pass
+
+
 def to_rest_group_id(internal_id: str) -> str:
     return "group." + base64.b64encode(internal_id.encode()).decode()
 
@@ -274,17 +278,25 @@ class SignalClient:
             }
         resp = await self._http.post("/v2/send", json=body)
         resp.raise_for_status()
+        # The REST API sends the timestamp as a decimal string.
         try:
-            timestamp = resp.json()["timestamp"]
+            return int(resp.json()["timestamp"])
         except (ValueError, KeyError, TypeError):
             return None
-        return timestamp if isinstance(timestamp, int) else None
 
-    async def attachment(self, attachment_id: str) -> bytes:
-        """A received attachment, which signal-cli downloads as messages arrive."""
-        resp = await self._http.get(f"/v1/attachments/{quote_path(attachment_id, safe='')}")
-        resp.raise_for_status()
-        return resp.content
+    async def attachment(self, attachment_id: str, max_bytes: int) -> bytes:
+        """A received attachment, which signal-cli downloads as messages arrive.
+
+        Raises AttachmentTooLarge past max_bytes, without downloading the rest.
+        """
+        async with self._http.stream("GET", f"/v1/attachments/{quote_path(attachment_id, safe='')}") as resp:
+            resp.raise_for_status()
+            data = bytearray()
+            async for chunk in resp.aiter_bytes():
+                data += chunk
+                if len(data) > max_bytes:
+                    raise AttachmentTooLarge(f"Attachment {attachment_id} is over {max_bytes} bytes")
+            return bytes(data)
 
     async def install_sticker_pack(self, pack_id: str, pack_key: str) -> None:
         """Install a pack, so the account can send its stickers. signal-cli downloads it first."""

@@ -45,7 +45,8 @@ from tldr_bot.reactions import (
 )
 from tldr_bot.sticker_pack import (
     DEFAULT_EMOJI,
-    PackRef,
+    MAX_IMAGE_PIXELS,
+    NewSticker,
     StickerAdd,
     StickerPackUploader,
     StickerRateLimited,
@@ -66,6 +67,7 @@ from tldr_bot.stickers import (
 )
 from tldr_bot import stickers as stickers_module
 from tldr_bot.signal_api import (
+    AttachmentTooLarge,
     DirectMessage,
     Sticker,
     GroupDelete,
@@ -78,7 +80,7 @@ from tldr_bot.signal_api import (
     render_mentions,
     to_rest_group_id,
 )
-from tldr_bot.store import ChatMessage, MessageStore, PackSticker
+from tldr_bot.store import ChatMessage, MessageStore, PackRef, PackSticker
 
 GROUP = "abcDEF123+/="
 
@@ -1452,7 +1454,7 @@ async def test_upload_puts_every_file_with_its_signed_form(tmp_path):
     uploader = StickerPackUploader(str(tmp_path), "+420999")
     uploader._service._transport = httpx.MockTransport(service)
     uploader._cdn._transport = httpx.MockTransport(cdn)
-    pack = await uploader.upload([PackSticker(5, b"first", "😺"), PackSticker(9, b"second", "🐦")])
+    pack = await uploader.upload([PackSticker(5, b"first", "😺"), NewSticker(b"second", "🐦")])
 
     assert pack.pack_id == pack_id and pack.url.startswith("https://signal.art/addstickers/#pack_id=")
     key = bytes.fromhex(pack.pack_key)
@@ -1477,10 +1479,15 @@ def test_store_images_and_stickers():
     store.delete(GROUP, "uuid-bob", 7)
     assert store.image(GROUP, ("uuid-bob",), 7) is None
 
-    first = store.add_sticker(b"one", "😺")
-    store.add_sticker(b"two", "🐦")
-    store.remove_sticker(first)
+    v1, v2 = PackRef("01", "k"), PackRef("02", "k")
+    store.add_sticker(b"one", "😺", v1)
+    store.add_sticker(b"two", "🐦", v2)
+    assert store.sticker_pack() == v2
+    store.remove_sticker(store.stickers()[0].id, v1)
     assert [(s.image, s.emoji) for s in store.stickers()] == [(b"two", "🐦")] and store.sticker_count() == 1
+    assert store.sticker_pack() == v1
+    store.remove_sticker(store.stickers()[0].id, None)
+    assert store.sticker_pack() is None
 
 
 class FakePacks:
@@ -1501,7 +1508,7 @@ class StickerSignal(FakeSignal):
         self.attachments = {"a.jpg": png()}
         self.installed = []
 
-    async def attachment(self, attachment_id):
+    async def attachment(self, attachment_id, max_bytes):
         if attachment_id not in self.attachments:
             raise httpx.HTTPStatusError("missing", request=httpx.Request("GET", "http://x"), response=httpx.Response(404))
         return self.attachments[attachment_id]
@@ -1531,7 +1538,7 @@ async def test_sticker_from_a_reply_to_an_image():
     [stickers] = bot.sticker_packs.uploads
     assert [s.emoji for s in stickers] == ["😺"]
     assert Image.open(io.BytesIO(stickers[0].image)).size == (512, 512)
-    pack = bot.sticker_pack
+    pack = bot.store.sticker_pack()
     assert bot.signal.installed == [pack.pack_id]
     # The reply is the new sticker, quoting the command.
     _, text, kwargs = bot.signal.sent[-1]
@@ -1557,14 +1564,14 @@ async def test_sticker_from_an_image_with_the_command_as_caption_and_from_the_bo
 
 async def test_sticker_remove_uploads_the_rest():
     bot = sticker_bot()
-    bot.store.add_sticker(b"one", "😺")
-    bot.store.add_sticker(b"two", "🐦")
+    bot.store.add_sticker(b"one", "😺", PackRef("01", "k"))
+    bot.store.add_sticker(b"two", "🐦", PackRef("02", "k"))
     reply = await send_command(bot, "/sticker remove 1", 1)
-    assert reply.startswith("Removed sticker 1") and bot.sticker_pack.url in reply
+    assert reply.startswith("Removed sticker 1") and bot.store.sticker_pack().url in reply
     assert [s.image for s in bot.sticker_packs.uploads[-1]] == [b"two"]
     assert "no sticker 5" in await send_command(bot, "/sticker remove 5", 2)
     assert "empty" in await send_command(bot, "/sticker remove 1", 3)
-    assert bot.sticker_pack is None and bot.store.sticker_count() == 0
+    assert bot.store.sticker_pack() is None and bot.store.sticker_count() == 0
 
 
 async def test_failed_upload_keeps_the_pack_as_it_was():
@@ -1572,7 +1579,7 @@ async def test_failed_upload_keeps_the_pack_as_it_was():
     bot.handle(envelope(group_data("/sticker", ts=1, attachments=[{"contentType": "image/png", "id": "a.jpg"}])))
     await finish_tasks(bot)
     assert "couldn't upload" in bot.signal.sent[-1][1]
-    assert bot.store.sticker_count() == 0 and bot.sticker_pack is None
+    assert bot.store.sticker_count() == 0 and bot.store.sticker_pack() is None
 
 
 @pytest.mark.parametrize("text, expected", [
@@ -1596,3 +1603,68 @@ async def test_sticker_explains_what_went_wrong():
 
     bot.sticker_packs = None
     assert "aren't set up" in await send_command(bot, "/sticker", 4)
+
+
+def test_make_sticker_refuses_huge_images_before_decoding():
+    side = int(MAX_IMAGE_PIXELS**0.5) + 10
+    out = io.BytesIO()
+    Image.new("1", (side, side)).save(out, "PNG")  # tiny file, huge image
+    with pytest.raises(StickerError, match="too big"):
+        make_sticker(out.getvalue())
+
+
+async def test_send_group_returns_the_string_timestamp():
+    signal = SignalClient("http://signal", "+420999")
+    signal._http._transport = httpx.MockTransport(lambda request: httpx.Response(201, json={"timestamp": "1700000000123"}))
+    assert await signal.send_group(GROUP, "hi") == 1700000000123
+
+
+async def test_attachment_download_stops_past_the_limit():
+    signal = SignalClient("http://signal", "+420999")
+    signal._http._transport = httpx.MockTransport(lambda request: httpx.Response(200, content=b"x" * 100))
+    assert await signal.attachment("a.jpg", 100) == b"x" * 100
+    with pytest.raises(AttachmentTooLarge):
+        await signal.attachment("a.jpg", 99)
+
+
+async def test_the_bots_own_images_only_work_in_their_group():
+    bot = sticker_bot()
+    bot.cats.random_cat = lambda: asyncio.sleep(0, ("image/png", png()))
+    await send_command(bot, "/macka", 1)
+    cat_ts = 10_000 + len(bot.signal.sent)
+    other = dict(group_data("/sticker", ts=2), groupInfo={"groupId": "other", "type": "DELIVER"})
+    bot.handle(envelope(other | {"quote": {"id": cat_ts, "authorUuid": "uuid-bot", "text": ""}}))
+    await finish_tasks(bot)
+    assert "can't find that image" in bot.signal.sent[-1][1] and bot.sticker_packs.uploads == []
+
+
+async def test_a_failed_cdn_upload_cancels_the_others(tmp_path):
+    write_account(tmp_path, 1)
+    pack_id = "ab" * 16
+    started, cancelled = asyncio.Event(), []
+
+    def service(request: httpx.Request):
+        return httpx.Response(200, json={
+            "packId": pack_id,
+            "manifest": upload_form("manifest") | {"id": -1},
+            "stickers": [upload_form(f"full/{i}") | {"id": i} for i in range(2)],
+        })
+
+    uploader = StickerPackUploader(str(tmp_path), "+420999")
+    uploader._service._transport = httpx.MockTransport(service)
+
+    async def put(upload_form, data):
+        if upload_form["key"] == "full/1":
+            await started.wait()
+            raise httpx.ConnectError("boom")
+        started.set()
+        try:
+            await asyncio.sleep(10)
+        except asyncio.CancelledError:
+            cancelled.append(upload_form["key"])
+            raise
+
+    uploader._put = put
+    with pytest.raises(StickerUploadError, match="ConnectError"):
+        await uploader.upload([NewSticker(b"a", "😺"), NewSticker(b"b", "🐦")])
+    assert sorted(cancelled) == ["full/0", "manifest"]

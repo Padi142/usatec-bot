@@ -1,9 +1,8 @@
 import asyncio
-import json
 import logging
 import re
 from collections.abc import Awaitable, Callable
-from dataclasses import asdict, dataclass, replace
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -37,6 +36,7 @@ from .signal_api import (
     GroupDelete,
     GroupEdit,
     GroupMessage,
+    AttachmentTooLarge,
     SignalClient,
     Sticker,
     parse_event,
@@ -45,7 +45,7 @@ from .signal_api import (
 from .sticker_pack import (
     DEFAULT_EMOJI,
     MAX_STICKERS,
-    PackRef,
+    NewSticker,
     StickerAdd,
     StickerCommand,
     StickerPackUploader,
@@ -80,11 +80,11 @@ REACTION_RULES_SETTING = "reaction_rules"
 # get no reaction rather than a late one.
 MAX_PENDING_REACTIONS = 20
 
-# Settings key for the current version of the shared sticker pack, as JSON.
-STICKER_PACK_SETTING = "sticker_pack"
 # Images the bot sent itself, kept so /sticker works on replies to them. They don't
 # come back as events, so there's no attachment id to fetch them by later.
 MAX_OWN_IMAGES = 50
+# Attachments /sticker downloads at most. Signal allows 100 MB.
+MAX_STICKER_SOURCE_BYTES = 25 * 1024 * 1024
 
 STICKER_USAGE = (
     "Reply to an image with /sticker or /sticker 😺 to add it to the sticker pack.\n"
@@ -302,8 +302,8 @@ class TldrBot:
         self._tasks: set[asyncio.Task] = set()
         # Pack edits read the pack and upload a new one, so they take turns.
         self._sticker_lock = asyncio.Lock()
-        # Timestamp to image, oldest first.
-        self._own_images: dict[int, bytes] = {}
+        # (group id, timestamp) to image, oldest first.
+        self._own_images: dict[tuple[str, int], bytes] = {}
         # Models with a summary running. Each runs one at a time, across all groups.
         self._busy_models: set[str] = set()
         self._reaction_slot = asyncio.Semaphore(1)
@@ -408,7 +408,7 @@ class TldrBot:
         )
         image = next((data for content_type, data in attachments or [] if content_type.startswith("image/")), None)
         if timestamp is not None and image is not None:
-            self._own_images[timestamp] = image
+            self._own_images[(to.group_id, timestamp)] = image
             while len(self._own_images) > MAX_OWN_IMAGES:
                 del self._own_images[next(iter(self._own_images))]
 
@@ -449,17 +449,8 @@ class TldrBot:
         except Exception:
             log.exception("/mackagen failed")
 
-    @property
-    def sticker_pack(self) -> PackRef | None:
-        """The current version of the shared sticker pack, if it has any stickers."""
-        raw = self.store.setting(STICKER_PACK_SETTING)
-        return PackRef(**json.loads(raw)) if raw else None
-
-    def _save_sticker_pack(self, pack: PackRef | None) -> None:
-        self.store.set_setting(STICKER_PACK_SETTING, json.dumps(asdict(pack)) if pack else None)
-
     def _sticker_usage(self) -> str:
-        pack, count = self.sticker_pack, self.store.sticker_count()
+        pack, count = self.store.sticker_pack(), self.store.sticker_count()
         if pack is None:
             return f"{STICKER_USAGE}\n\nThe pack is empty."
         return f"{STICKER_USAGE}\n\nThe pack has {count} of {MAX_STICKERS} stickers:\n{pack.url}"
@@ -500,25 +491,24 @@ class TldrBot:
             async with self._sticker_lock:
                 if self.store.sticker_count() >= MAX_STICKERS:
                     return f"The pack is full, it has {MAX_STICKERS} stickers. /sticker remove <n> makes room."
-                image = await self._sticker_source(msg)
+                try:
+                    image = await self._sticker_source(msg)
+                except AttachmentTooLarge:
+                    return "That image is too big for a sticker."
                 if image is None:
                     return "I can't find that image. I only know images sent while I'm running."
                 try:
-                    sticker = await asyncio.to_thread(make_sticker, image)
+                    sticker = NewSticker(await asyncio.to_thread(make_sticker, image), emoji or DEFAULT_EMOJI)
                 except StickerError as e:
                     log.warning("Sticker conversion failed: %s", e)
                     return "I couldn't turn that into a sticker."
-                sticker_id = self.store.add_sticker(sticker, emoji or DEFAULT_EMOJI)
-                stickers = self.store.stickers()
-                try:
-                    pack = await self.sticker_packs.upload(stickers)
-                except Exception:
-                    self.store.remove_sticker(sticker_id)
-                    raise
-                self._save_sticker_pack(pack)
+                stickers = [*self.store.stickers(), sticker]
+                # Saved only once the pack with it is uploaded.
+                pack = await self.sticker_packs.upload(stickers)
+                self.store.add_sticker(sticker.image, sticker.emoji, pack)
         finally:
             await self.signal.set_typing(msg.group_id, False)
-        position = next(i for i, s in enumerate(stickers) if s.id == sticker_id)
+        position = len(stickers) - 1
         # The sticker itself is the reply. Tapping it opens the new pack, ready to install.
         try:
             await self.signal.install_sticker_pack(pack.pack_id, pack.pack_key)
@@ -532,13 +522,13 @@ class TldrBot:
         """The image a /sticker message is about: its own image, or the one it replies to."""
         attachment_id = msg.image
         if attachment_id is None and msg.quote is not None:
-            if (own := self._own_images.get(msg.quote.timestamp)) is not None:
+            if (own := self._own_images.get((msg.group_id, msg.quote.timestamp))) is not None:
                 return own
             attachment_id = self.store.image(msg.group_id, msg.quote.author_ids, msg.quote.timestamp)
         if attachment_id is None:
             return None
         try:
-            return await self.signal.attachment(attachment_id)
+            return await self.signal.attachment(attachment_id, MAX_STICKER_SOURCE_BYTES)
         except httpx.HTTPError as e:
             log.warning("Image download failed: %s", e)
             return None
@@ -552,8 +542,7 @@ class TldrBot:
             removed = stickers[position - 1]
             remaining = [s for s in stickers if s.id != removed.id]
             pack = await self.sticker_packs.upload(remaining) if remaining else None
-            self.store.remove_sticker(removed.id)
-            self._save_sticker_pack(pack)
+            self.store.remove_sticker(removed.id, pack)
         if pack is None:
             return "Removed the last sticker, the pack is empty now."
         return f"Removed sticker {position}. The new pack:\n{pack.url}"

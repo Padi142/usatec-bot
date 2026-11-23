@@ -1,5 +1,6 @@
+import json
 import sqlite3
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS messages (
@@ -45,11 +46,26 @@ class ChatMessage:
     text: str
 
 
+# Settings key for the current version of the shared sticker pack, as JSON.
+STICKER_PACK_SETTING = "sticker_pack"
+
+
 @dataclass(frozen=True)
 class PackSticker:
     id: int
     image: bytes  # a 512x512 WebP
     emoji: str
+
+
+@dataclass(frozen=True)
+class PackRef:
+    """One uploaded version of the sticker pack."""
+    pack_id: str  # hex
+    pack_key: str  # hex
+
+    @property
+    def url(self) -> str:
+        return f"https://signal.art/addstickers/#pack_id={self.pack_id}&pack_key={self.pack_key}"
 
 
 class MessageStore:
@@ -110,14 +126,32 @@ class MessageStore:
     def sticker_count(self) -> int:
         return self._db.execute("SELECT COUNT(*) FROM stickers").fetchone()[0]
 
-    def add_sticker(self, image: bytes, emoji: str) -> int:
-        with self._db:
-            cursor = self._db.execute("INSERT INTO stickers (image, emoji) VALUES (?, ?)", (image, emoji))
-        return cursor.lastrowid or 0
+    def sticker_pack(self) -> PackRef | None:
+        """The current version of the shared sticker pack, None while it's empty."""
+        raw = self.setting(STICKER_PACK_SETTING)
+        return PackRef(**json.loads(raw)) if raw else None
 
-    def remove_sticker(self, sticker_id: int) -> None:
+    # Edits take the pack version that was uploaded with them, so the stored stickers
+    # and the published pack change together or not at all.
+
+    def add_sticker(self, image: bytes, emoji: str, pack: PackRef) -> None:
+        with self._db:
+            self._db.execute("INSERT INTO stickers (image, emoji) VALUES (?, ?)", (image, emoji))
+            self._set_pack(pack)
+
+    def remove_sticker(self, sticker_id: int, pack: PackRef | None) -> None:
         with self._db:
             self._db.execute("DELETE FROM stickers WHERE id = ?", (sticker_id,))
+            self._set_pack(pack)
+
+    def _set_pack(self, pack: PackRef | None) -> None:
+        if pack is None:
+            self._db.execute("DELETE FROM settings WHERE key = ?", (STICKER_PACK_SETTING,))
+        else:
+            self._db.execute(
+                "INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+                (STICKER_PACK_SETTING, json.dumps(asdict(pack))),
+            )
 
     def last_before(
         self, group_id: str, before_timestamp: int, limit: int, after_timestamp: int | None = None
