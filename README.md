@@ -59,8 +59,10 @@ it needs `CAT_GEN_API_KEY` to be set.
 `/feature <request>` saves a feature request as a GitHub issue labeled `feature-request`,
 and replies with its link. Open requests get built in batches, see
 [`.claude/skills/build-features`](.claude/skills/build-features/SKILL.md). The repo is public,
-so the request and the sender's display name are public too. It needs `GITHUB_TOKEN`: a
-fine-grained token with only **Issues: read and write** on this repo.
+so the request and the sender's display name are public too. Phone numbers are masked and
+GitHub mentions don't notify anyone. Each person can send one request every 5 minutes.
+It needs `GITHUB_TOKEN`: a fine-grained token with only **Issues: read and write** on this repo,
+from an account with write access to it, or GitHub drops the label.
 
 ## How it works
 

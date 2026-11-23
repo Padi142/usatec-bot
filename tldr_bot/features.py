@@ -11,6 +11,11 @@ FEATURE_RE = re.compile(r"^\s*/feature(?:\s+(.*?))?\s*$", re.IGNORECASE | re.DOT
 FEATURE_LABEL = "feature-request"
 MAX_REQUEST_CHARS = 2000
 MAX_TITLE_CHARS = 80
+# A sender's next request has to wait this long, so one person can't flood the public tracker.
+COOLDOWN_SECONDS = 300
+
+# Anything that could be a phone number. Signal falls back to numbers for names and mentions.
+PHONE_RE = re.compile(r"\+?\d[\d ()./-]{6,}\d")
 
 
 @dataclass(frozen=True)
@@ -24,17 +29,26 @@ def parse_feature_command(text: str) -> FeatureCommand | None:
     return FeatureCommand(request=m[1] or None) if m else None
 
 
+def public_text(text: str) -> str:
+    """Make chat text safe to post in the public repo.
+
+    Phone numbers are masked, and a zero-width space after each @ keeps GitHub from
+    notifying anyone the text mentions.
+    """
+    return PHONE_RE.sub("[number]", text).replace("@", "@\u200b")
+
+
 def issue_title(request: str) -> str:
     """The request's first line, cut at a word boundary to fit an issue title."""
-    first = " ".join(request.split("\n", 1)[0].split())
+    first = " ".join(public_text(request).split("\n", 1)[0].split())
     if len(first) <= MAX_TITLE_CHARS:
         return first
     return first[: MAX_TITLE_CHARS - 1].rsplit(" ", 1)[0] + "…"
 
 
 def issue_body(request: str, requester: str) -> str:
-    # Only the display name: the repo is public, so phone numbers and ids stay out.
-    return f"{request}\n\n---\nRequested on Signal by {requester} with /feature."
+    """The request and who sent it. Only a display name, never a Signal id."""
+    return f"{public_text(request)}\n\n---\nRequested on Signal by {public_text(requester)} with /feature."
 
 
 class GitHubError(Exception):
@@ -45,6 +59,7 @@ class GitHubError(Exception):
 class Issue:
     number: int
     url: str
+    labels: frozenset[str] = frozenset()
 
 
 class GitHubIssues:
@@ -52,6 +67,7 @@ class GitHubIssues:
 
     def __init__(self, token: str, repo: str, timeout: float = 30):
         self.repo = repo
+        self.requests_url = f"https://github.com/{repo}/issues?q=is%3Aopen+label%3A{FEATURE_LABEL}"
         self._http = httpx.AsyncClient(
             base_url="https://api.github.com",
             timeout=timeout,
@@ -66,12 +82,17 @@ class GitHubIssues:
         await self._http.aclose()
 
     async def create(self, title: str, body: str, labels: list[str]) -> Issue:
+        """Create an issue. GitHub silently drops labels the token isn't allowed to set."""
         try:
             resp = await self._http.post(
                 f"/repos/{self.repo}/issues", json={"title": title, "body": body, "labels": labels}
             )
             resp.raise_for_status()
             data = resp.json()
-            return Issue(number=int(data["number"]), url=str(data["html_url"]))
+            return Issue(
+                number=int(data["number"]),
+                url=str(data["html_url"]),
+                labels=frozenset(str(label["name"]) for label in data.get("labels", [])),
+            )
         except (httpx.HTTPError, ValueError, KeyError, TypeError) as e:
             raise GitHubError(f"{type(e).__name__}: {e}") from e
