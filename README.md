@@ -83,8 +83,16 @@ account never broadcasts to every group it's in. Set `ANNOUNCE_UPDATES=false` to
 
 `/sticker` as a reply to an image adds it to the sticker pack all groups share, and the bot
 replies with the new sticker. Tap it to install the pack. `/sticker 😺` gives the sticker an emoji,
-and an image sent with `/sticker` as its caption works too. `/sticker remove 3` removes the third
-sticker, and `/sticker` on its own shows the pack's link.
+and an image sent with `/sticker` as its caption works too. `/sticker` on its own shows the pack's link.
+
+`/sticker list` sends a picture of the pack with each sticker's number. `/sticker remove 3 5`
+removes stickers 3 and 5, and `/sticker emoji 3 😺` changes sticker 3's emoji. Both also work
+without a number, as a reply to a sticker from the pack, from any version of it sent while the
+bot was running.
+
+Stickers are PNGs, because signal-cli sends a sticker with the type it sniffs from the file and
+doesn't recognize WebP, and Signal Desktop squashes stickers without a type. Most are under
+100 KiB, the size Desktop downloads without asking.
 
 Signal sticker packs can't change, so each edit uploads the whole pack again as a new pack, and
 it has to be installed again to get the new stickers. Signal allows about 20 uploads a day. The

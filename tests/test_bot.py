@@ -2,6 +2,7 @@ import asyncio
 import base64
 import io
 import json
+import random
 import sqlite3
 import os
 from datetime import datetime, timedelta
@@ -68,8 +69,11 @@ from tldr_bot.reactions import (
 from tldr_bot.sticker_pack import (
     DEFAULT_EMOJI,
     MAX_IMAGE_PIXELS,
+    MAX_STICKER_BYTES,
     NewSticker,
     StickerAdd,
+    StickerEmoji,
+    StickerList,
     StickerPackUploader,
     StickerRateLimited,
     StickerRemove,
@@ -77,6 +81,7 @@ from tldr_bot.sticker_pack import (
     StickerUsage,
     account_credentials,
     make_sticker,
+    pack_sheet,
     parse_sticker_command,
 )
 from tldr_bot.stickers import (
@@ -1835,9 +1840,15 @@ def png(width=40, height=20, color=(255, 0, 0, 255)) -> bytes:
 @pytest.mark.parametrize("text, expected", [
     ("/sticker", StickerAdd()),
     ("/STICKER 😺 ", StickerAdd("😺")),
-    ("/sticker remove 3", StickerRemove(3)),
-    ("/sticker remove", StickerUsage()),
+    ("/sticker List", StickerList()),
+    ("/sticker remove 3", StickerRemove((3,))),
+    ("/sticker remove 3 1", StickerRemove((3, 1))),
+    ("/sticker remove", StickerRemove()),
     ("/sticker remove 0", StickerUsage()),
+    ("/sticker remove all", StickerUsage()),
+    ("/sticker emoji 2 🐦", StickerEmoji("🐦", 2)),
+    ("/sticker emoji 🐦", StickerEmoji("🐦")),
+    ("/sticker emoji", StickerUsage()),
     ("/sticker 😺 extra", StickerUsage()),
     ("/stickers", None),
 ])
@@ -1864,12 +1875,27 @@ def test_built_pack_files_decrypt_and_parse():
 
 def test_make_sticker_fits_any_image_into_512_square():
     sticker = Image.open(io.BytesIO(make_sticker(png(40, 20))))
-    assert sticker.format == "WEBP" and sticker.size == (512, 512)
+    assert sticker.format == "PNG" and sticker.size == (512, 512)
     # Scaled up to the full width and centered, with transparent bands above and below.
     red, green, _, alpha = sticker.getpixel((256, 256))
     assert red > 240 and green < 15 and alpha == 255 and sticker.getpixel((256, 10))[3] == 0
     with pytest.raises(StickerError):
         make_sticker(b"not an image")
+
+
+def test_make_sticker_uses_fewer_colors_for_photos_too_big_as_png():
+    out = io.BytesIO()
+    Image.frombytes("RGB", (512, 512), random.Random(1).randbytes(512 * 512 * 3)).save(out, "PNG")
+    assert len(out.getvalue()) > MAX_STICKER_BYTES
+    sticker = make_sticker(out.getvalue())
+    assert len(sticker) <= MAX_STICKER_BYTES and Image.open(io.BytesIO(sticker)).mode == "P"
+
+
+def test_pack_sheet_lays_stickers_out_in_a_grid():
+    sheet = Image.open(io.BytesIO(pack_sheet([png(512, 512)] * 5)))
+    assert sheet.format == "JPEG" and sheet.size == (3 * 256, 2 * 256)
+    assert sheet.getpixel((128, 128))[0] > 200  # the first sticker, red
+    assert sheet.getpixel((640, 384)) == pytest.approx((222, 222, 226), abs=8)  # the empty sixth cell
 
 
 def write_account(tmp_path, device_id):
@@ -1944,15 +1970,35 @@ def test_store_images_and_stickers():
     store.delete(GROUP, "uuid-bob", 7)
     assert store.image(GROUP, ("uuid-bob",), 7) is None
 
-    v1, v2 = PackRef("01", "k"), PackRef("02", "k")
+    v1, v2, v3 = PackRef("01", "k"), PackRef("02", "k"), PackRef("03", "k")
     store.add_sticker(b"one", "😺", v1)
     store.add_sticker(b"two", "🐦", v2)
     assert store.sticker_pack() == v2
-    store.remove_sticker(store.stickers()[0].id, v1)
+    one, two = store.stickers()
+    store.remove_stickers([one.id], v3)
     assert [(s.image, s.emoji) for s in store.stickers()] == [(b"two", "🐦")] and store.sticker_count() == 1
-    assert store.sticker_pack() == v1
-    store.remove_sticker(store.stickers()[0].id, None)
-    assert store.sticker_pack() is None
+    assert store.sticker_pack() == v3
+    # Each version's sticker ids point at the stored stickers they showed.
+    store.add_sticker_message(GROUP, 1, "02", 1)
+    store.add_sticker_message(GROUP, 2, "03", 0)
+    store.add_sticker_message(GROUP, 3, "02", 0)  # removed since
+    store.add_sticker_message(GROUP, 4, "02", 2)  # not in that version
+    store.add_sticker_message(GROUP, 5, "ff", 0)  # another pack
+    assert [store.sticker_message(GROUP, ts) for ts in range(1, 6)] == [two.id, two.id, None, None, None]
+    store.remove_stickers([two.id], None)
+    assert store.sticker_pack() is None and store.sticker_message(GROUP, 1) is None
+
+
+def test_store_knows_the_pack_version_from_before_versions_were_kept(tmp_path):
+    path = str(tmp_path / "bot.db")
+    store = MessageStore(path, 1000)
+    store.add_sticker(b"one", "😺", PackRef("01", "k"))
+    with store._db:
+        store._db.execute("DELETE FROM sticker_pack_versions")
+    store.close()
+    store = MessageStore(path, 1000)
+    store.add_sticker_message(GROUP, 1, "01", 0)
+    assert store.sticker_message(GROUP, 1) == store.stickers()[0].id
 
 
 class FakePacks:
@@ -2024,14 +2070,69 @@ async def test_sticker_from_an_image_with_the_command_as_caption_and_from_the_bo
 
 async def test_sticker_remove_uploads_the_rest():
     bot = sticker_bot()
-    bot.store.add_sticker(b"one", "😺", PackRef("01", "k"))
-    bot.store.add_sticker(b"two", "🐦", PackRef("02", "k"))
-    reply = await send_command(bot, "/sticker remove 1", 1)
-    assert reply.startswith("Removed sticker 1") and bot.store.sticker_pack().url in reply
+    for image, emoji in [(b"one", "😺"), (b"two", "🐦"), (b"three", "🐈")]:
+        bot.store.add_sticker(image, emoji, PackRef("01", "k"))
+    reply = await send_command(bot, "/sticker remove 3 1 3", 1)
+    assert reply.startswith("Removed stickers 1, 3.") and bot.store.sticker_pack().url in reply
     assert [s.image for s in bot.sticker_packs.uploads[-1]] == [b"two"]
-    assert "no sticker 5" in await send_command(bot, "/sticker remove 5", 2)
+    assert "no sticker 5" in await send_command(bot, "/sticker remove 1 5", 2)
+    assert bot.store.sticker_count() == 1
     assert "empty" in await send_command(bot, "/sticker remove 1", 3)
     assert bot.store.sticker_pack() is None and bot.store.sticker_count() == 0
+
+
+async def test_sticker_remove_and_emoji_as_a_reply_to_a_sticker():
+    bot = sticker_bot()
+    bot.handle(envelope(group_data("/sticker", ts=1, attachments=[{"contentType": "image/png", "id": "a.jpg"}])))
+    await finish_tasks(bot)
+    bots_sticker_ts = 10_000 + len(bot.signal.sent)
+    bot.handle(envelope(group_data("/sticker 🐦", ts=2, attachments=[{"contentType": "image/png", "id": "a.jpg"}])))
+    await finish_tasks(bot)
+    first_version = bot.store.sticker_pack().pack_id
+    # Someone sends the second sticker from the version they installed.
+    bot.handle(envelope(group_data(None, ts=3, sticker={"packId": first_version.upper(), "stickerId": 1})))
+
+    bot.handle(reply_to("/sticker emoji 🦜", 4, 3))
+    await finish_tasks(bot)
+    assert bot.signal.sent[-1][1].startswith("Sticker 2 is 🦜 now.")
+    assert [s.emoji for s in bot.sticker_packs.uploads[-1]] == [DEFAULT_EMOJI, "🦜"]
+
+    # The bot's own sticker, from the first version of the pack.
+    bot.handle(reply_to("/sticker remove", 5, bots_sticker_ts, author="uuid-bot"))
+    await finish_tasks(bot)
+    assert bot.signal.sent[-1][1].startswith("Removed sticker 1.")
+    assert [s.emoji for s in bot.store.stickers()] == ["🦜"]
+
+    for ts, quote_ts in [(6, bots_sticker_ts), (7, 999)]:  # removed already, not a sticker
+        bot.handle(reply_to("/sticker remove", ts, quote_ts))
+        await finish_tasks(bot)
+        assert "Reply to a sticker from the pack" in bot.signal.sent[-1][1]
+    assert "Reply to a sticker" in await send_command(bot, "/sticker remove", 8)
+    assert "isn't an emoji" in await send_command(bot, "/sticker emoji 1 abc", 9)
+    assert len(bot.sticker_packs.uploads) == 4
+
+
+async def test_sticker_list_sends_the_numbered_sheet():
+    bot = sticker_bot()
+    assert await send_command(bot, "/sticker list", 1) == "The pack is empty."
+    bot.store.add_sticker(make_sticker(png()), "😺", PackRef("01", "k"))
+    text = await send_command(bot, "/sticker list", 2)
+    assert text.startswith("The pack has 1 of 200 stickers") and bot.store.sticker_pack().url in text
+    [(content_type, sheet)] = bot.signal.sent[-1][2]["attachments"]
+    assert content_type == "image/jpeg" and Image.open(io.BytesIO(sheet)).format == "JPEG"
+
+
+async def test_webp_stickers_from_before_are_converted_to_png():
+    bot = sticker_bot()
+    webp = io.BytesIO()
+    Image.new("RGBA", (512, 512), (0, 0, 255, 255)).save(webp, "WEBP")
+    bot.store.add_sticker(webp.getvalue(), "😺", PackRef("01", "k"))
+    bot.store.add_sticker(make_sticker(png()), "🐦", PackRef("02", "k"))
+    png_before = bot.store.stickers()[1].image
+    await bot.convert_webp_stickers()
+    converted, untouched = bot.store.stickers()
+    assert Image.open(io.BytesIO(converted.image)).format == "PNG" and untouched.image == png_before
+    assert bot.store.sticker_pack() == PackRef("02", "k")
 
 
 async def test_failed_upload_keeps_the_pack_as_it_was():

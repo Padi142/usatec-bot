@@ -10,6 +10,7 @@ them itself with the account's credentials, read from signal-cli's data director
 import asyncio
 import io
 import json
+import math
 import os
 import re
 import ssl
@@ -18,7 +19,7 @@ from pathlib import Path
 from typing import Protocol
 
 import httpx
-from PIL import Image, ImageOps
+from PIL import Image, ImageDraw, ImageFont, ImageOps
 
 from .stickers import SIGNAL_CA, SIGNAL_CDN, StickerError, build_manifest, encrypt
 from .store import PackRef
@@ -30,8 +31,13 @@ DEFAULT_EMOJI = "🙂"
 # Signal's limits: 200 stickers (plus a cover) per pack, 300 KiB per sticker.
 MAX_STICKERS = 200
 MAX_STICKER_BYTES = 300 * 1024
+# Signal Desktop downloads bigger stickers only for people who let it download photos.
+AUTO_DOWNLOAD_STICKER_BYTES = 100 * 1024
 STICKER_SIZE = 512
-STICKER_CONTENT_TYPE = "image/webp"
+# PNG, not WebP: signal-cli sends a sticker with the type it sniffs from the file, and Java
+# doesn't recognize WebP. Signal Desktop then can't tell the sticker's size and squashes it.
+STICKER_CONTENT_TYPE = "image/png"
+PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 # Bigger images are refused before decoding, to bound the memory a sticker costs.
 # JPEGs are decoded at a reduced size first, so this mostly limits PNGs and the like.
 MAX_IMAGE_PIXELS = 25_000_000
@@ -47,8 +53,22 @@ class StickerAdd:
 
 
 @dataclass(frozen=True)
+class StickerList:
+    pass
+
+
+# Stickers are named by their 1-based position in the pack. No positions means
+# the sticker the command replies to.
+
+@dataclass(frozen=True)
 class StickerRemove:
-    position: int  # 1-based, in the order the pack shows its stickers
+    positions: tuple[int, ...] = ()
+
+
+@dataclass(frozen=True)
+class StickerEmoji:
+    emoji: str
+    position: int | None = None
 
 
 @dataclass(frozen=True)
@@ -56,32 +76,45 @@ class StickerUsage:
     pass
 
 
-StickerCommand = StickerAdd | StickerRemove | StickerUsage
+StickerCommand = StickerAdd | StickerList | StickerRemove | StickerEmoji | StickerUsage
+
+SUBCOMMANDS = ("list", "remove", "emoji")
+
+
+def _position(arg: str) -> int | None:
+    return int(arg) if arg.isdigit() and int(arg) >= 1 else None
 
 
 def parse_sticker_command(text: str) -> StickerCommand | None:
-    """Parse "/sticker [emoji]" or "/sticker remove <n>". Returns None for other commands.
+    """Parse "/sticker [emoji]", "/sticker list", "/sticker remove [n...]" or "/sticker emoji [n] <emoji>".
 
-    Whether a bare "/sticker" adds an image or shows the usage depends on whether
-    there's an image, so that's for the caller to decide.
+    Returns None for other commands. Whether a bare "/sticker" adds an image or shows
+    the usage depends on whether there's an image, so that's for the caller to decide.
     """
     m = STICKER_RE.match(text)
     if not m:
         return None
     args = (m[1] or "").split()
-    match args:
-        case []:
+    subcommand = args[0].lower() if args else None
+    match [subcommand, *args[1:]]:
+        case [None]:
             return StickerAdd()
-        case ["remove", n] if n.isdigit() and int(n) >= 1:
-            return StickerRemove(int(n))
-        case [emoji] if emoji.lower() != "remove":
-            return StickerAdd(emoji)
+        case ["list"]:
+            return StickerList()
+        case ["remove", *ns] if all(_position(n) for n in ns):
+            return StickerRemove(tuple(int(n) for n in ns))
+        case ["emoji", emoji]:
+            return StickerEmoji(emoji)
+        case ["emoji", n, emoji] if (position := _position(n)):
+            return StickerEmoji(emoji, position)
+        case [_] if subcommand not in SUBCOMMANDS:
+            return StickerAdd(args[0])
         case _:
             return StickerUsage()
 
 
 def make_sticker(image: bytes) -> bytes:
-    """Fit an image into a transparent 512x512 WebP under Signal's size limit. Raises StickerError."""
+    """Fit an image into a transparent 512x512 PNG under Signal's size limit. Raises StickerError."""
     try:
         with Image.open(io.BytesIO(image)) as img:
             # Image.open only reads the header, so nothing big is decoded yet.
@@ -95,12 +128,51 @@ def make_sticker(image: bytes) -> bytes:
         raise StickerError(f"Not an image I can read: {e}") from e
     canvas = Image.new("RGBA", (STICKER_SIZE, STICKER_SIZE), (0, 0, 0, 0))
     canvas.paste(frame, ((STICKER_SIZE - frame.width) // 2, (STICKER_SIZE - frame.height) // 2))
-    for quality in (90, 75, 60, 40, 20):
+    # Photos are big as full-color PNGs. Fewer colors, dithered, still look like them.
+    smallest = b""
+    for colors in (None, 256, 128, 64):
         out = io.BytesIO()
-        canvas.save(out, "WEBP", quality=quality)
-        if out.tell() <= MAX_STICKER_BYTES:
+        quantized = canvas if colors is None else canvas.quantize(colors, method=Image.Quantize.FASTOCTREE)
+        quantized.save(out, "PNG", optimize=True)
+        if out.tell() <= AUTO_DOWNLOAD_STICKER_BYTES:
             return out.getvalue()
-    raise StickerError("The sticker doesn't fit in Signal's size limit")
+        if not smallest or out.tell() < len(smallest):
+            smallest = out.getvalue()
+    if len(smallest) > MAX_STICKER_BYTES:
+        raise StickerError("The sticker doesn't fit in Signal's size limit")
+    return smallest
+
+
+# The sheet /sticker list sends: as wide as a phone screen shows sharply, cells big enough to see.
+SHEET_WIDTH = 1536
+SHEET_CELL_SIZES = (96, 256)  # smallest and largest
+SHEET_BACKGROUND = (222, 222, 226)
+
+
+def pack_sheet(images: list[bytes]) -> bytes:
+    """A JPEG of stickers in a grid, each labeled with its 1-based position, so people can name one."""
+    columns = math.ceil(math.sqrt(len(images)))
+    rows = math.ceil(len(images) / columns)
+    smallest, largest = SHEET_CELL_SIZES
+    cell = max(smallest, min(largest, SHEET_WIDTH // columns))
+    margin = cell // 16
+    sheet = Image.new("RGB", (columns * cell, rows * cell), SHEET_BACKGROUND)
+    draw = ImageDraw.Draw(sheet)
+    font = ImageFont.load_default(size=cell // 5)
+    for i, data in enumerate(images):
+        x, y = i % columns * cell, i // columns * cell
+        # Stored stickers are ones make_sticker made, so they're small and safe to decode.
+        with Image.open(io.BytesIO(data)) as image:
+            picture = image.convert("RGBA")
+        picture.thumbnail((cell - 2 * margin, cell - 2 * margin))
+        sheet.paste(picture, (x + (cell - picture.width) // 2, y + (cell - picture.height) // 2), picture)
+        draw.text(
+            (x + margin, y + margin), str(i + 1), font=font, fill="white",
+            stroke_width=max(2, cell // 40), stroke_fill="black",
+        )
+    out = io.BytesIO()
+    sheet.save(out, "JPEG", quality=85)
+    return out.getvalue()
 
 
 class StickerImage(Protocol):
