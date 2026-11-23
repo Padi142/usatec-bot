@@ -277,6 +277,11 @@ def format_models(models: list[ModelInfo], current: str) -> str:
     return "\n\n".join(sections)
 
 
+def transcript_safe(text: str) -> str:
+    """Picture text on one line, so text in a screenshot can't pose as transcript lines or tags."""
+    return " ".join(text.split()).translate(str.maketrans("<>[]", "‹›()"))
+
+
 def build_transcript(messages: list[ChatMessage], max_chars: int) -> tuple[str, int]:
     """Format messages as transcript lines, keeping the newest ones that fit in max_chars.
 
@@ -287,6 +292,8 @@ def build_transcript(messages: list[ChatMessage], max_chars: int) -> tuple[str, 
     for msg in reversed(messages):
         when = datetime.fromtimestamp(msg.timestamp / 1000, LOCAL_TZ).strftime("%Y-%m-%d %H:%M")
         line = f"[{when}] {msg.sender_name}: {msg.text}"
+        if msg.picture:
+            line += f" [picture, as a vision model read it: {transcript_safe(msg.picture)}]"
         if lines and total + len(line) + 1 > max_chars:
             break
         lines.append(line)
@@ -350,7 +357,7 @@ class TldrBot:
             case GroupDelete():
                 self.store.delete(event.group_id, event.sender_id, event.target_timestamp)
             case GroupEdit():
-                # Replaces the stored text as a whole, which drops any [image: ...] description.
+                # Only the text changes: a picture description stays with the message.
                 text = render_mentions(event.text, event.mentions, self.store.display_name)
                 self.store.edit(event.group_id, event.sender_id, event.target_timestamp, text)
             case GroupMessage() if is_macka_command(event.text):
@@ -382,15 +389,16 @@ class TldrBot:
                 log.info("/react from %s in group %s", event.sender_name, event.group_id)
                 self._spawn(self.run_react_command(event, react_command))
             case GroupMessage():
-                command = parse_command(event.text)
+                # The body, so a /tldr sent as a reply or with a picture still counts as one.
+                command = parse_command(event.body or "")
                 if command is None:
                     text = render_mentions(event.text, event.mentions, self.store.display_name)
-                    self.store.add(
-                        ChatMessage(event.group_id, event.sender_id, event.sender_name, event.timestamp, text)
-                    )
-                    if event.image:
-                        self.store.add_image(event.group_id, event.sender_id, event.timestamp, event.image.id)
-                    self._queue_reaction(event)
+                    message = ChatMessage(event.group_id, event.sender_id, event.sender_name, event.timestamp, text)
+                    # A redelivered message was already described and judged.
+                    if self.store.add(message):
+                        if event.image:
+                            self.store.add_image(event.group_id, event.sender_id, event.timestamp, event.image.id)
+                        self._queue_reaction(event)
                 else:
                     log.info("/tldr from %s in group %s", event.sender_name, event.group_id)
                     self._spawn(self.run_tldr(event, command))
@@ -636,13 +644,7 @@ class TldrBot:
         """Describe the message's pictures for /tldr, and react if it matches a rule."""
         description = await self._picture_description(msg)
         if description is not None:
-            text = render_mentions(msg.text, msg.mentions, self.store.display_name)
-            self.store.edit(
-                msg.group_id,
-                msg.sender_id,
-                msg.timestamp,
-                text.replace("[attachment]", f"[image: {description}]", 1),
-            )
+            self.store.set_picture(msg.group_id, msg.sender_id, msg.timestamp, description)
         rules = self.reaction_rules
         if not rules:
             return

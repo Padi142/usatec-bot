@@ -10,6 +10,7 @@ CREATE TABLE IF NOT EXISTS messages (
     sender_name TEXT    NOT NULL,
     timestamp   INTEGER NOT NULL,
     text        TEXT    NOT NULL,
+    picture     TEXT,  -- what the vision model read in the message's pictures
     UNIQUE (group_id, sender_id, timestamp)
 );
 CREATE INDEX IF NOT EXISTS idx_messages_group_ts ON messages (group_id, timestamp);
@@ -44,6 +45,7 @@ class ChatMessage:
     sender_name: str
     timestamp: int  # milliseconds since epoch, as sent by Signal
     text: str
+    picture: str | None = None  # a description of its pictures, filled in after it's stored
 
 
 # Settings key for the current version of the shared sticker pack, as JSON.
@@ -73,21 +75,37 @@ class MessageStore:
         self.history_limit = history_limit
         self._db = sqlite3.connect(path)
         self._db.executescript(SCHEMA)
+        # Databases from before the picture column.
+        columns = {row[1] for row in self._db.execute("PRAGMA table_info(messages)")}
+        if "picture" not in columns:
+            with self._db:
+                self._db.execute("ALTER TABLE messages ADD COLUMN picture TEXT")
         self._inserts_since_prune = 0
 
     def close(self) -> None:
         self._db.close()
 
-    def add(self, msg: ChatMessage) -> None:
+    def add(self, msg: ChatMessage) -> bool:
+        """Store a message. False if it was already stored, as when Signal delivers it again."""
         with self._db:
-            self._db.execute(
+            inserted = self._db.execute(
                 "INSERT OR IGNORE INTO messages (group_id, sender_id, sender_name, timestamp, text)"
                 " VALUES (?, ?, ?, ?, ?)",
                 (msg.group_id, msg.sender_id, msg.sender_name, msg.timestamp, msg.text),
-            )
+            ).rowcount == 1
         self._inserts_since_prune += 1
         if self._inserts_since_prune >= PRUNE_EVERY:
             self.prune()
+        return inserted
+
+    def set_picture(self, group_id: str, sender_id: str, timestamp: int, description: str) -> None:
+        """Attach a picture description to a stored message. Edits keep it, a delete drops it."""
+        with self._db:
+            self._db.execute(
+                "UPDATE messages SET picture = ?"
+                " WHERE group_id = ? AND sender_id = ? AND timestamp = ? AND picture IS NULL",
+                (description, group_id, sender_id, timestamp),
+            )
 
     def edit(self, group_id: str, sender_id: str, target_timestamp: int, new_text: str) -> None:
         with self._db:
@@ -161,7 +179,7 @@ class MessageStore:
         `after_timestamp` is exclusive; None means "since the beginning".
         """
         sql = (
-            "SELECT group_id, sender_id, sender_name, timestamp, text FROM messages"
+            "SELECT group_id, sender_id, sender_name, timestamp, text, picture FROM messages"
             " WHERE group_id = ? AND timestamp < ?"
         )
         params: list[object] = [group_id, before_timestamp]
@@ -176,7 +194,7 @@ class MessageStore:
     def last_from(self, group_id: str, sender_id: str, before_timestamp: int) -> ChatMessage | None:
         """The sender's most recent message sent before `before_timestamp`, if any."""
         row = self._db.execute(
-            "SELECT group_id, sender_id, sender_name, timestamp, text FROM messages"
+            "SELECT group_id, sender_id, sender_name, timestamp, text, picture FROM messages"
             " WHERE group_id = ? AND sender_id = ? AND timestamp < ?"
             " ORDER BY timestamp DESC LIMIT 1",
             (group_id, sender_id, before_timestamp),
