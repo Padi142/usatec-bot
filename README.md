@@ -72,10 +72,11 @@ from an account with write access to it, or GitHub drops the label.
 
 After a deploy with new commits, the bot posts a short "What's new" summary to the groups in
 `ALLOWED_GROUPS`, or the commit titles if the LLM is unavailable. It compares the deployed commit
-(`SOURCE_COMMIT`, which Coolify sets) with the one each group last heard about, so a plain restart
-posts nothing, and a group that missed a post gets it on the next start. Without `SOURCE_COMMIT`
-or with `ALLOWED_GROUPS` empty it announces nothing, so a linked personal account never
-broadcasts to every group it's in. Set `ANNOUNCE_UPDATES=false` to turn these announcements off.
+with the one each group last heard about, so a plain restart posts nothing, and a group that
+missed a post gets it on the next start. The deployed commit is `SOURCE_COMMIT` if it's set, and
+otherwise the newest commit on `master`. Coolify doesn't pass `SOURCE_COMMIT` into the containers,
+so on Coolify it's `master`. With `ALLOWED_GROUPS` empty it announces nothing, so a linked personal
+account never broadcasts to every group it's in. Set `ANNOUNCE_UPDATES=false` to turn these announcements off.
 
 `/sticker` as a reply to an image adds it to the sticker pack all groups share, and the bot
 replies with the new sticker. Tap it to install the pack. `/sticker 😺` gives the sticker an emoji,
