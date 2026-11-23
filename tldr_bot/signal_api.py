@@ -218,6 +218,25 @@ def render_mentions(text: str, mentions: list[Mention], name_for) -> str:
     return text
 
 
+def sent_timestamp(response: object) -> int | None:
+    """The timestamp of a sent message from a /v2/send response, or None if it doesn't have one.
+
+    Newer REST API versions answer with a list, one entry per send, and report recipients that
+    didn't get it under "errors" while still returning 201. Those are logged: the group got it.
+    """
+    entry = response[0] if isinstance(response, list) and response else response
+    if not isinstance(entry, dict):
+        return None
+    failed = (entry.get("errors") or {}).get("recipients") or []
+    if failed:
+        log.warning("%d recipients didn't get a message: %s", len(failed), {r.get("reason") for r in failed})
+    try:
+        # The REST API sends the timestamp as a decimal string.
+        return int(entry["timestamp"])
+    except (ValueError, KeyError, TypeError):
+        return None
+
+
 class SignalClient:
     def __init__(self, base_url: str, number: str):
         self.base_url = base_url
@@ -286,10 +305,9 @@ class SignalClient:
             }
         resp = await self._http.post("/v2/send", json=body)
         resp.raise_for_status()
-        # The REST API sends the timestamp as a decimal string.
         try:
-            return int(resp.json()["timestamp"])
-        except (ValueError, KeyError, TypeError):
+            return sent_timestamp(resp.json())
+        except ValueError:
             return None
 
     async def install_sticker_pack(self, pack_id: str, pack_key: str) -> None:

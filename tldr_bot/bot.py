@@ -14,10 +14,13 @@ from .config import Config
 from .features import (
     COOLDOWN_SECONDS,
     FEATURE_LABEL,
+    MAX_ANNOUNCED_COMMITS,
     MAX_REQUEST_CHARS,
+    Comparison,
     FeatureCommand,
     GitHubError,
-    GitHubIssues,
+    GitHubClient,
+    format_commit_messages,
     issue_body,
     issue_title,
     parse_feature_command,
@@ -90,6 +93,16 @@ TIME_RE = re.compile(r"^(\d{1,2}):(\d{2})$")
 # Settings key for the model chosen with /model.
 MODEL_SETTING = "llm_model"
 REACTION_RULES_SETTING = "reaction_rules"
+# Per group, the commit it last heard about, so a failed send only retries that group.
+ANNOUNCED_COMMIT_PREFIX = "announced_commit:"
+
+# How long the announcement waits for the Signal connection, and then how long it may take.
+# Separate, so a slow start can't eat the time the announcement needs.
+SIGNAL_READY_TIMEOUT = 300.0
+ANNOUNCE_TIMEOUT = 120.0
+# The summary gets less, so there's time left to send the commit titles instead.
+ANNOUNCE_SUMMARY_TIMEOUT = 60.0
+MAX_ANNOUNCEMENT_CHARS = 1500
 
 # The API key allows 4 parallel requests and summaries need them, so reactions run
 # one at a time. Past this many waiting, for example during an outage, new messages
@@ -312,7 +325,7 @@ class TldrBot:
         cats: CatClient,
         cat_gen: CatGenClient | None = None,
         stickers: StickerEmojis | None = None,  # None means stickers get no reactions
-        issues: GitHubIssues | None = None,  # None means /feature is disabled
+        github: GitHubClient | None = None,  # None means no /feature and no announcements
         sticker_packs: StickerPackUploader | None = None,  # None means /sticker is disabled
     ):
         self.cfg = cfg
@@ -322,7 +335,7 @@ class TldrBot:
         self.cats = cats
         self.cat_gen = cat_gen
         self.stickers = stickers
-        self.issues = issues
+        self.github = github
         self._last_feature: dict[str, float] = {}  # sender id -> monotonic time of their last /feature
         self.sticker_packs = sticker_packs
         self._tasks: set[asyncio.Task] = set()
@@ -336,11 +349,76 @@ class TldrBot:
         self._pending_reactions = 0
 
     async def run(self) -> None:
+        self._spawn(self.announce_updates())
         async for payload in self.signal.events():
             try:
                 self.handle(payload)
             except Exception:
                 log.exception("Failed to handle payload: %.500s", payload)
+
+    async def announce_updates(self) -> None:
+        """Tell the allowed groups what changed since the version they last heard about. Never raises."""
+        if not self.cfg.announce_updates:
+            return
+        try:
+            async with asyncio.timeout(SIGNAL_READY_TIMEOUT):
+                while not self.signal.connected:
+                    await asyncio.sleep(1)
+            async with asyncio.timeout(ANNOUNCE_TIMEOUT):
+                await self._announce_updates()
+        except Exception:
+            log.exception("Deploy announcement failed")
+
+    async def _announce_updates(self) -> None:
+        deployed = self.cfg.source_commit
+        if self.github is None or deployed is None:
+            log.info("Skipping deploy announcement: SOURCE_COMMIT isn't set")
+            return
+        if not self.cfg.allowed_groups:
+            # A linked personal account sees every group, so never broadcast to all of them.
+            log.info("Skipping deploy announcement: ALLOWED_GROUPS is empty")
+            return
+
+        behind: dict[str, list[str]] = {}  # last announced commit -> groups that last heard of it
+        for group_id in sorted(self.cfg.allowed_groups):
+            key = ANNOUNCED_COMMIT_PREFIX + group_id
+            last = self.store.setting(key)
+            if last is None:
+                self.store.set_setting(key, deployed)  # first run: nothing to compare with
+            elif last != deployed:
+                behind.setdefault(last, []).append(group_id)
+
+        for last, group_ids in behind.items():
+            comparison = await self.github.compare(last, deployed)
+            text = await self._whats_new(comparison) if comparison is not None else None
+            for group_id in group_ids:
+                if text is not None:
+                    try:
+                        timestamp = await self.signal.send_group(group_id, text)
+                    except httpx.HTTPError as e:
+                        log.error("Deploy announcement to group %s failed: %s", group_id, e)
+                        continue  # the next start tries this group again
+                    if timestamp is None:
+                        log.error("Signal didn't confirm the deploy announcement to group %s", group_id)
+                        continue
+                # Also when there's nothing to say: a rollback, or a commit GitHub no longer knows.
+                self.store.set_setting(ANNOUNCED_COMMIT_PREFIX + group_id, deployed)
+
+    async def _whats_new(self, comparison: Comparison) -> str | None:
+        """The announcement for a comparison, or None when it has no commits."""
+        commits = comparison.commits[:MAX_ANNOUNCED_COMMITS]
+        if not commits:
+            return None
+        try:
+            async with asyncio.timeout(ANNOUNCE_SUMMARY_TIMEOUT):
+                summary = await self.llm.summarize_commits(format_commit_messages(commits), self.current_model)
+        except (LLMError, TimeoutError) as e:
+            log.warning("Deploy summary failed, posting the commit titles instead: %s", e)
+            summary = "\n".join(f"- {c.title}" for c in commits)
+        header = "What's new:"
+        if comparison.ahead_by > len(commits):
+            header = f"What's new (the latest {len(commits)} of {comparison.ahead_by} changes):"
+        return f"{header}\n\n{summary}"[:MAX_ANNOUNCEMENT_CHARS]
 
     def handle(self, payload: dict) -> None:
         event = parse_event(payload)
@@ -491,7 +569,7 @@ class TldrBot:
 
     async def _file_feature(self, msg: GroupMessage, command: FeatureCommand) -> str:
         """File the request as a GitHub issue and return what to tell the sender."""
-        if self.issues is None:
+        if self.github is None or not self.github.can_file_issues:
             return "Feature requests aren't set up (GITHUB_TOKEN is missing)."
         if command.request is None:
             return "Usage: /feature <what the bot should do>\nI'll save it for the next build session."
@@ -504,7 +582,7 @@ class TldrBot:
             return f"You can send one request every {COOLDOWN_SECONDS // 60} minutes, try again later."
         self._last_feature[msg.sender_id] = now
         try:
-            issue = await self.issues.create(
+            issue = await self.github.create(
                 issue_title(command.request), issue_body(command.request, msg.sender_name), [FEATURE_LABEL]
             )
         except GitHubError as e:
@@ -512,7 +590,7 @@ class TldrBot:
             log.error("Filing a feature request failed: %s", e)
             return (
                 "Sorry, I couldn't confirm that your request was saved. "
-                f"Check the open requests before sending it again:\n{self.issues.requests_url}"
+                f"Check the open requests before sending it again:\n{self.github.requests_url}"
             )
         if FEATURE_LABEL not in issue.labels:
             log.error("Issue #%d was created without the %s label", issue.number, FEATURE_LABEL)
