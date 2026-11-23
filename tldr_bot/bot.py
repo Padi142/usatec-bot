@@ -25,6 +25,7 @@ from .features import (
 from .llm import LLMClient, LLMError, ModelInfo
 from .reactions import (
     INSTRUCTIONS,
+    MAX_DESCRIPTION_CHARS,
     MAX_IMAGE_BYTES,
     MAX_MESSAGE_CHARS,
     MAX_RULES,
@@ -276,6 +277,11 @@ def format_models(models: list[ModelInfo], current: str) -> str:
     return "\n\n".join(sections)
 
 
+def transcript_safe(text: str) -> str:
+    """Picture text on one line, so text in a screenshot can't pose as transcript lines or tags."""
+    return " ".join(text.split()).translate(str.maketrans("<>[]", "‹›()"))
+
+
 def build_transcript(messages: list[ChatMessage], max_chars: int) -> tuple[str, int]:
     """Format messages as transcript lines, keeping the newest ones that fit in max_chars.
 
@@ -286,6 +292,8 @@ def build_transcript(messages: list[ChatMessage], max_chars: int) -> tuple[str, 
     for msg in reversed(messages):
         when = datetime.fromtimestamp(msg.timestamp / 1000, LOCAL_TZ).strftime("%Y-%m-%d %H:%M")
         line = f"[{when}] {msg.sender_name}: {msg.text}"
+        if msg.picture:
+            line += f" [picture, as a vision model read it: {transcript_safe(msg.picture)}]"
         if lines and total + len(line) + 1 > max_chars:
             break
         lines.append(line)
@@ -349,6 +357,7 @@ class TldrBot:
             case GroupDelete():
                 self.store.delete(event.group_id, event.sender_id, event.target_timestamp)
             case GroupEdit():
+                # Only the text changes: a picture description stays with the message.
                 text = render_mentions(event.text, event.mentions, self.store.display_name)
                 self.store.edit(event.group_id, event.sender_id, event.target_timestamp, text)
             case GroupMessage() if is_macka_command(event.text):
@@ -380,15 +389,17 @@ class TldrBot:
                 log.info("/react from %s in group %s", event.sender_name, event.group_id)
                 self._spawn(self.run_react_command(event, react_command))
             case GroupMessage():
-                command = parse_command(event.text)
+                # Any picture can become a sticker later, even one sent with /tldr or delivered twice.
+                if event.image:
+                    self.store.add_image(event.group_id, event.sender_id, event.timestamp, event.image.id)
+                # The body, so a /tldr sent as a reply or with a picture still counts as one.
+                command = parse_command(event.body or "")
                 if command is None:
                     text = render_mentions(event.text, event.mentions, self.store.display_name)
-                    self.store.add(
-                        ChatMessage(event.group_id, event.sender_id, event.sender_name, event.timestamp, text)
-                    )
-                    if event.image:
-                        self.store.add_image(event.group_id, event.sender_id, event.timestamp, event.image.id)
-                    self._queue_reaction(event)
+                    message = ChatMessage(event.group_id, event.sender_id, event.sender_name, event.timestamp, text)
+                    # A redelivered message was already described and judged.
+                    if self.store.add(message):
+                        self._queue_reaction(event)
                 else:
                     log.info("/tldr from %s in group %s", event.sender_name, event.group_id)
                     self._spawn(self.run_tldr(event, command))
@@ -610,13 +621,10 @@ class TldrBot:
         return load_rules(self.store.setting(REACTION_RULES_SETTING))
 
     def _queue_reaction(self, msg: GroupMessage) -> None:
-        # Other attachments, like files and videos, have nothing to judge.
-        judgeable = (
-            bool(msg.body)
-            or bool(judged_images(msg.attachments))
-            or (msg.sticker is not None and self.stickers is not None)
-        )
-        if not judgeable or not self.reaction_rules:
+        # Other attachments, like files and videos, have nothing to describe or judge.
+        has_pictures = bool(judged_images(msg.attachments))
+        has_text = bool(msg.body) or (msg.sticker is not None and self.stickers is not None)
+        if not has_pictures and not (has_text and self.reaction_rules):
             return
         if self._pending_reactions >= MAX_PENDING_REACTIONS:
             log.warning("Too many pending reactions, skipping a message")
@@ -634,9 +642,14 @@ class TldrBot:
             self._pending_reactions -= 1
 
     async def _react(self, msg: GroupMessage) -> None:
-        """React if the message matches a rule. A failure only costs the reaction, the chat sees nothing."""
+        """Describe the message's pictures for /tldr, and react if it matches a rule."""
+        description = await self._picture_description(msg)
+        if description is not None:
+            self.store.set_picture(msg.group_id, msg.sender_id, msg.timestamp, description)
         rules = self.reaction_rules
-        state = judged_state(await self._judged_text(msg), await self._picture_description(msg))
+        if not rules:
+            return
+        state = judged_state(await self._judged_text(msg), description)
         if not state:
             return
         try:
@@ -655,7 +668,10 @@ class TldrBot:
         try:
             async with asyncio.timeout(PICTURE_TIMEOUT):
                 images = await self._download_pictures(msg)
-                return await self.llm.describe_images(images, self.cfg.vision_model) if images else None
+                if not images:
+                    return None
+                description = (await self.llm.describe_images(images, self.cfg.vision_model)).strip()
+                return description[:MAX_DESCRIPTION_CHARS] or None
         except TimeoutError:
             log.warning("Picture description took over %ss", PICTURE_TIMEOUT)
         except LLMError as e:
