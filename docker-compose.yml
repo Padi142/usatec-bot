@@ -36,6 +36,8 @@ services:
       - GITHUB_TOKEN=${GITHUB_TOKEN:-}
       - GITHUB_REPO=${GITHUB_REPO:-}
       - ANNOUNCE_UPDATES=${ANNOUNCE_UPDATES:-}
+      # Coolify fills this in with the commit it deployed.
+      - SOURCE_COMMIT=${SOURCE_COMMIT:-}
       - SIGNAL_CLI_DIR=/signal-cli
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
       - TZ=${TZ:-Europe/Prague}

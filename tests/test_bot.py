@@ -11,7 +11,7 @@ import pytest
 from PIL import Image
 
 from tldr_bot.bot import (
-    ANNOUNCED_COMMIT_SETTING,
+    ANNOUNCED_COMMIT_PREFIX,
     MAX_STICKER_SOURCE_BYTES,
     LOCAL_TZ,
     MAX_PENDING_REACTIONS,
@@ -37,10 +37,11 @@ from tldr_bot.features import (
     MAX_ANNOUNCED_COMMITS,
     MAX_TITLE_CHARS,
     Commit,
+    Comparison,
     FeatureCommand,
     GitHubClient,
     GitHubError,
-    GitHubIssues,
+    GitHubClient,
     Issue,
     format_commit_messages,
     issue_body,
@@ -645,6 +646,8 @@ async def test_send_group_with_attachment():
 # --- end to end through the bot ----------------------------------------------
 
 class FakeSignal:
+    connected = True
+
     def __init__(self):
         self.sent = []
         self.direct = []
@@ -1542,7 +1545,7 @@ async def test_github_issue_request():
             "number": 7, "html_url": "https://github.com/o/r/issues/7", "labels": [{"name": "feature-request"}],
         })
 
-    issues = GitHubIssues("tok", "o/r")
+    issues = GitHubClient("tok", "o/r")
     issues._http._transport = httpx.MockTransport(handler)
     issue = await issues.create("t", "b", ["feature-request"])
     assert issue == Issue(7, "https://github.com/o/r/issues/7", frozenset({"feature-request"}))
@@ -1552,6 +1555,7 @@ async def test_github_issue_request():
 
 
 class FakeIssues:
+    can_file_issues = True
     requests_url = "https://github.com/o/r/issues?q=label%3Afeature-request"
 
     def __init__(self, error=None, keeps_labels=True, commits=None):
@@ -1567,18 +1571,23 @@ class FakeIssues:
         n = len(self.created)
         return Issue(n, f"https://github.com/o/r/issues/{n}", frozenset(labels if self.keeps_labels else ()))
 
-    async def recent_commits(self, sha="master", per_page=21):
+    async def compare(self, base, head):
+        """self.commits is the history, newest first, and base is looked up in it."""
         if self.error:
             raise self.error
-        return list(self.commits[:per_page])
+        shas = [c.sha for c in self.commits]
+        if base not in shas or head not in shas:
+            return None
+        newer = self.commits[shas.index(head):shas.index(base)]
+        return Comparison(tuple(newer), len(newer))
 
 
 async def test_feature_files_a_labeled_issue_with_only_the_display_name():
     bot = make_bot()
-    bot.issues = FakeIssues()
+    bot.github = FakeIssues()
     reply = await send_command(bot, "/feature add a /weather command", 1)
     assert reply.startswith("Saved as #1") and "issues/1" in reply
-    [(title, body, labels)] = bot.issues.created
+    [(title, body, labels)] = bot.github.created
     assert title == "add a /weather command" and labels == ["feature-request"]
     assert "by Alice" in body and "uuid-alice" not in body
     # Commands aren't chat: not summarized, and no reaction.
@@ -1587,7 +1596,7 @@ async def test_feature_files_a_labeled_issue_with_only_the_display_name():
 
 @pytest.mark.parametrize("issues, text, expected", [
     (None, "/feature x", "aren't set up"),
-    (GitHubIssues(None, "o/r"), "/feature x", "aren't set up"),
+    (GitHubClient(None, "o/r"), "/feature x", "aren't set up"),
     (FakeIssues(), "/feature", "Usage"),
     (FakeIssues(), "/feature " + "x" * 2001, "too long"),
     (FakeIssues(GitHubError("timed out")), "/feature x", "Check the open requests"),
@@ -1595,7 +1604,7 @@ async def test_feature_files_a_labeled_issue_with_only_the_display_name():
 ])
 async def test_feature_failures_are_explained(issues, text, expected):
     bot = make_bot()
-    bot.issues = issues
+    bot.github = issues
     assert expected in await send_command(bot, text, 1)
 
 
@@ -1609,10 +1618,10 @@ def test_issue_text_hides_phone_numbers_and_github_mentions():
 
 async def test_feature_requests_have_a_per_sender_cooldown():
     bot = make_bot()
-    bot.issues = FakeIssues()
+    bot.github = FakeIssues()
     assert "Saved as #1" in await send_command(bot, "/feature one", 1)
     assert "try again later" in await send_command(bot, "/feature two", 2)
-    assert len(bot.issues.created) == 1
+    assert len(bot.github.created) == 1
 
 
 # --- /sticker -----------------------------------------------------------------
@@ -1920,38 +1929,37 @@ async def test_a_failed_cdn_upload_cancels_the_others(tmp_path):
 
 # --- deploy announcements ----------------------------------------------------
 
-async def test_github_recent_commits_with_and_without_token():
+async def test_github_compare_with_and_without_token():
     requests: list[httpx.Request] = []
 
     def handler(request: httpx.Request):
         requests.append(request)
-        return httpx.Response(200, json=[
-            {"sha": "sha2", "commit": {"message": "Add /weather\n\nShows the forecast."}},
+        if "gone" in request.url.path:
+            return httpx.Response(404, json={"message": "Not Found"})
+        return httpx.Response(200, json={"ahead_by": 2, "commits": [
             {"sha": "sha1", "commit": {"message": "Initial commit"}},
-        ])
+            {"sha": "sha2", "commit": {"message": "Add /weather\n\nShows the forecast."}},
+        ]})
 
     for token in (None, "tok"):
         client = GitHubClient(token, "o/r")
         client._http._transport = httpx.MockTransport(handler)
-        commits = await client.recent_commits("master", per_page=21)
+        comparison = await client.compare("sha0", "sha2")
+        assert comparison == Comparison(
+            (Commit("sha2", "Add /weather\n\nShows the forecast."), Commit("sha1", "Initial commit")), 2,
+        )
+        assert await client.compare("gone", "sha2") is None
         await client.close()
-        assert commits == [
-            Commit("sha2", "Add /weather\n\nShows the forecast."),
-            Commit("sha1", "Initial commit"),
-        ]
-        assert commits[0].title == "Add /weather"
+        assert client.can_file_issues == (token is not None)
 
-    unauthed, authed = requests
-    assert unauthed.url.path == "/repos/o/r/commits"
-    assert dict(unauthed.url.params) == {"sha": "master", "per_page": "21"}
-    assert "authorization" not in unauthed.headers
-    assert authed.headers["authorization"] == "Bearer tok"
+    assert requests[0].url.path == "/repos/o/r/compare/sha0...sha2"
+    assert "authorization" not in requests[0].headers
+    assert requests[2].headers["authorization"] == "Bearer tok"
 
 
 async def test_llm_summarize_commits():
     def handler(request: httpx.Request):
         body = json.loads(request.content)
-        assert request.url.path == "/v1/chat/completions"
         assert "What's new" in body["messages"][0]["content"]
         assert body["messages"][1]["content"] == "<commits>\nAdd /weather\n</commits>"
         return httpx.Response(200, json={"choices": [{"message": {"content": "<think>ok</think>\nAdded /weather."}}]})
@@ -1964,134 +1972,118 @@ async def test_llm_summarize_commits():
 def test_format_commit_messages_trims_total_size():
     commits = [Commit(f"s{i}", f"Title {i}\n\n" + "x" * 200) for i in range(10)]
     formatted = format_commit_messages(commits, max_chars=500)
-    assert len(formatted) <= 500
-    assert "Title 0" in formatted and "Title 1" in formatted
-    assert "Title 9" not in formatted
+    assert len(formatted) <= 500 and "Title 1" in formatted and "Title 9" not in formatted
 
 
-def announce_bot(commits=None, error=None, **overrides):
-    bot = make_bot(**({"allowed_groups": frozenset({GROUP})} | overrides))
-    bot.issues = FakeIssues(error=error, commits=commits)
+HISTORY = [Commit("sha3", "Add /weather\n\nForecast for Prague."), Commit("sha2", "Fix /tldr"), Commit("sha1", "Old")]
+OTHER_GROUP = "other-group"
+
+
+def announce_bot(deployed="sha3", commits=HISTORY, **overrides):
+    bot = make_bot(**({"allowed_groups": frozenset({GROUP, OTHER_GROUP}), "source_commit": deployed} | overrides))
+    bot.github = FakeIssues(commits=commits)
     return bot
 
 
-async def test_announce_first_run_stores_head_and_stays_silent():
-    bot = announce_bot([Commit("sha2", "Second"), Commit("sha1", "First")])
+def heard(bot, sha):
+    for group_id in (GROUP, OTHER_GROUP):
+        bot.store.set_setting(ANNOUNCED_COMMIT_PREFIX + group_id, sha)
+
+
+def announced(bot):
+    return {g: bot.store.setting(ANNOUNCED_COMMIT_PREFIX + g) for g in (GROUP, OTHER_GROUP)}
+
+
+async def test_announce_first_run_and_restart_stay_silent():
+    bot = announce_bot()
     await bot.announce_updates()
-    assert bot.store.setting(ANNOUNCED_COMMIT_SETTING) == "sha2"
-    assert bot.signal.sent == []
-    assert bot.llm.commit_logs == []
-
-
-async def test_announce_restart_with_same_head_stays_silent():
-    bot = announce_bot([Commit("sha2", "Second"), Commit("sha1", "First")])
-    bot.store.set_setting(ANNOUNCED_COMMIT_SETTING, "sha2")
-    await bot.announce_updates()
-    assert bot.store.setting(ANNOUNCED_COMMIT_SETTING) == "sha2"
-    assert bot.signal.sent == []
-    assert bot.llm.commit_logs == []
-
-
-async def test_announce_new_commits_summarizes_once_and_posts_to_allowed_groups():
-    commits = [
-        Commit("sha3", "Add /weather\n\nForecast for Prague."),
-        Commit("sha2", "Fix typo in /tldr"),
-        Commit("sha1", "Initial commit"),
-    ]
-    bot = announce_bot(commits, allowed_groups=frozenset({GROUP, "group-2"}))
-    bot.store.set_setting(ANNOUNCED_COMMIT_SETTING, "sha1")
-    bot.store.set_setting("llm_model", "glm-5.3")
-
-    await bot.announce_updates()
-
-    [(log_text, model)] = bot.llm.commit_logs
-    assert model == "glm-5.3"
-    assert "Add /weather\n\nForecast for Prague." in log_text
-    assert "Fix typo in /tldr" in log_text
-    assert "Initial commit" not in log_text
-
-    assert [(g, t) for g, t, _ in bot.signal.sent] == [
-        (GROUP, "What's new:\n\nNew feature in chat."),
-        ("group-2", "What's new:\n\nNew feature in chat."),
-    ]
-    assert bot.store.setting(ANNOUNCED_COMMIT_SETTING) == "sha3"
-
-
-async def test_announce_caps_at_twenty_commits_and_marks_incomplete_when_stored_sha_is_missing():
-    commits = [Commit(f"sha{i}", f"Commit {i}") for i in range(25, 0, -1)]
-    bot = announce_bot(commits)
-    bot.store.set_setting(ANNOUNCED_COMMIT_SETTING, "old-sha")
-
-    await bot.announce_updates()
-
-    [(log_text, _)] = bot.llm.commit_logs
-    assert "Commit 25" in log_text and "Commit 6" in log_text
-    assert "Commit 5" not in log_text
-    [(_, text, _)] = bot.signal.sent
-    assert f"newest {MAX_ANNOUNCED_COMMITS} commits" in text and "incomplete" in text
-    assert bot.store.setting(ANNOUNCED_COMMIT_SETTING) == "sha25"
-
-
-async def test_announce_llm_failure_falls_back_to_commit_titles():
-    commits = [
-        Commit("sha3", "Add /weather\n\nMore details"),
-        Commit("sha2", "Fix /macka timeout"),
-        Commit("sha1", "Old"),
-    ]
-    bot = announce_bot(commits)
-    bot.store.set_setting(ANNOUNCED_COMMIT_SETTING, "sha1")
-    bot.llm.commit_summary = LLMError("down")
-
-    await bot.announce_updates()
-
-    [(group, text, _)] = bot.signal.sent
-    assert group == GROUP
-    assert text == "What's new:\n\n- Add /weather\n- Fix /macka timeout"
-    assert bot.store.setting(ANNOUNCED_COMMIT_SETTING) == "sha3"
-
-
-async def test_announce_empty_allowed_groups_posts_nothing(caplog):
-    bot = announce_bot([Commit("sha2", "New"), Commit("sha1", "Old")], allowed_groups=frozenset())
-    bot.store.set_setting(ANNOUNCED_COMMIT_SETTING, "sha1")
-
-    with caplog.at_level("INFO"):
-        await bot.announce_updates()
-
-    assert bot.signal.sent == []
-    assert bot.llm.commit_logs == []
-    assert bot.store.setting(ANNOUNCED_COMMIT_SETTING) == "sha1"
-    assert "ALLOWED_GROUPS is empty" in caplog.text
-
-
-async def test_announce_github_or_signal_error_leaves_stored_sha_unchanged():
-    bot = announce_bot(error=GitHubError("rate limit"))
-    bot.store.set_setting(ANNOUNCED_COMMIT_SETTING, "sha1")
-    await bot.announce_updates()
-    assert bot.signal.sent == []
-    assert bot.store.setting(ANNOUNCED_COMMIT_SETTING) == "sha1"
-
-    bot = announce_bot([Commit("sha2", "New"), Commit("sha1", "Old")])
-    bot.store.set_setting(ANNOUNCED_COMMIT_SETTING, "sha1")
-
-    async def fail_send(group_id, text, **kwargs):
-        raise httpx.ConnectError("signal down")
-
-    bot.signal.send_group = fail_send
-    await bot.announce_updates()
-    assert bot.store.setting(ANNOUNCED_COMMIT_SETTING) == "sha1"
-
-
-async def test_announce_disabled_by_config(monkeypatch):
-    for name, val in [
-        ("SIGNAL_NUMBER", "+420999"),
-        ("LLM_BASE_URL", "http://llm"),
-        ("LLM_MODEL", "deepseek"),
-        ("ANNOUNCE_UPDATES", "false"),
-    ]:
-        monkeypatch.setenv(name, val)
-    assert Config.from_env().announce_updates is False
-
-    bot = announce_bot([Commit("sha2", "New"), Commit("sha1", "Old")], announce_updates=False)
-    bot.store.set_setting(ANNOUNCED_COMMIT_SETTING, "sha1")
+    assert bot.signal.sent == [] and announced(bot) == {GROUP: "sha3", OTHER_GROUP: "sha3"}
     await bot.announce_updates()
     assert bot.signal.sent == [] and bot.llm.commit_logs == []
+
+
+async def test_announce_summarizes_the_deployed_commits_once_for_every_allowed_group():
+    bot = announce_bot(deployed="sha2")  # master is already at sha3, but sha2 is what runs
+    heard(bot, "sha1")
+    await bot.announce_updates()
+    assert len(bot.llm.commit_logs) == 1
+    assert "Fix /tldr" in bot.llm.commit_logs[0][0] and "weather" not in bot.llm.commit_logs[0][0]
+    assert sorted(g for g, _, _ in bot.signal.sent) == sorted([GROUP, OTHER_GROUP])
+    assert announced(bot) == {GROUP: "sha2", OTHER_GROUP: "sha2"}
+
+
+async def test_a_failed_send_retries_only_that_group():
+    bot = announce_bot()
+    heard(bot, "sha1")
+    send = bot.signal.send_group
+
+    async def flaky_send(group_id, text, **kwargs):
+        if group_id == OTHER_GROUP:
+            raise httpx.ConnectError("down")
+        await send(group_id, text, **kwargs)
+
+    bot.signal.send_group = flaky_send
+    await bot.announce_updates()
+    assert announced(bot) == {GROUP: "sha3", OTHER_GROUP: "sha1"}
+
+    bot.signal.send_group = send
+    await bot.announce_updates()
+    assert [g for g, _, _ in bot.signal.sent] == [GROUP, OTHER_GROUP]
+
+
+async def test_announce_falls_back_to_titles_when_the_summary_fails_or_stalls(monkeypatch):
+    monkeypatch.setattr(bot_module, "ANNOUNCE_SUMMARY_TIMEOUT", 0.01)
+    for failure in (LLMError("down"), "stall"):
+        bot = announce_bot(allowed_groups=frozenset({GROUP}))
+        bot.store.set_setting(ANNOUNCED_COMMIT_PREFIX + GROUP, "sha1")
+
+        async def summarize_commits(commits, model):
+            if failure == "stall":
+                await asyncio.sleep(10)
+            raise failure
+
+        bot.llm.summarize_commits = summarize_commits
+        await bot.announce_updates()
+        [(_, text, _)] = bot.signal.sent
+        assert text == "What's new:\n\n- Add /weather\n- Fix /tldr"
+
+
+async def test_announce_marks_a_capped_list_and_handles_unknown_commits():
+    history = [Commit(f"sha{i}", f"Commit {i}") for i in range(30, 0, -1)]
+    bot = announce_bot(deployed="sha30", commits=history, allowed_groups=frozenset({GROUP}))
+    bot.store.set_setting(ANNOUNCED_COMMIT_PREFIX + GROUP, "sha1")
+    await bot.announce_updates()
+    assert bot.signal.sent[0][1].startswith("What's new (the latest 20 of 29 changes):")
+
+    # After a force-push GitHub may not know the old commit: start over from here, silently.
+    bot.store.set_setting(ANNOUNCED_COMMIT_PREFIX + GROUP, "gone")
+    await bot.announce_updates()
+    assert len(bot.signal.sent) == 1 and bot.store.setting(ANNOUNCED_COMMIT_PREFIX + GROUP) == "sha30"
+
+
+@pytest.mark.parametrize("overrides", [
+    {"allowed_groups": frozenset()},
+    {"source_commit": None},
+    {"announce_updates": False},
+])
+async def test_announce_needs_allowed_groups_a_source_commit_and_the_switch(overrides):
+    bot = announce_bot(**overrides)
+    heard(bot, "sha1")
+    await bot.announce_updates()
+    assert bot.signal.sent == [] and bot.llm.commit_logs == []
+
+
+async def test_a_github_error_announces_nothing_and_keeps_the_last_commit():
+    bot = announce_bot()
+    heard(bot, "sha1")
+    bot.github.error = GitHubError("rate limit")
+    await bot.announce_updates()
+    assert bot.signal.sent == [] and announced(bot) == {GROUP: "sha1", OTHER_GROUP: "sha1"}
+
+
+def test_announce_config_from_env(monkeypatch):
+    for name, val in [("SIGNAL_NUMBER", "+420999"), ("LLM_BASE_URL", "http://llm"), ("LLM_MODEL", "deepseek"),
+                      ("ANNOUNCE_UPDATES", "false"), ("SOURCE_COMMIT", " abc ")]:
+        monkeypatch.setenv(name, val)
+    cfg = Config.from_env()
+    assert cfg.announce_updates is False and cfg.source_commit == "abc"

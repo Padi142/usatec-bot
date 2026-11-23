@@ -89,8 +89,10 @@ class Config:
     # /feature files GitHub issues here. Without a token, /feature is disabled.
     github_token: str | None = None
     github_repo: str = "Padi142/usatec-bot"
-    # Post a "What's new" summary to allowed_groups when startup sees new commits on master.
+    # Post a "What's new" summary to allowed_groups when a deploy brings new commits.
     announce_updates: bool = True
+    # The commit this container was built from. Coolify sets SOURCE_COMMIT; without it, no announcements.
+    source_commit: str | None = None
     # signal-cli's data directory, for the account credentials /sticker uploads packs with.
     # Without it, /sticker is disabled.
     signal_cli_dir: str | None = None
@@ -119,5 +121,6 @@ class Config:
             github_token=os.environ.get("GITHUB_TOKEN") or None,
             github_repo=os.environ.get("GITHUB_REPO") or cls.github_repo,
             announce_updates=_bool("ANNOUNCE_UPDATES", cls.announce_updates),
+            source_commit=os.environ.get("SOURCE_COMMIT", "").strip() or None,
             signal_cli_dir=os.environ.get("SIGNAL_CLI_DIR") or None,
         )

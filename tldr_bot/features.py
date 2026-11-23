@@ -93,24 +93,25 @@ def format_commit_messages(commits: Sequence[Commit], max_chars: int = MAX_COMMI
     return "\n\n".join(parts)
 
 
-class GitHubIssues:
-    """GitHub client for one repository: reads commits and, with a token, files issues."""
+@dataclass(frozen=True)
+class Comparison:
+    """The commits a deployed revision has on top of the last announced one."""
+    commits: tuple[Commit, ...]  # newest first; GitHub lists at most 250
+    ahead_by: int
+
+
+class GitHubClient:
+    """GitHub client for one repository: compares commits, and files issues when it has a token."""
 
     def __init__(self, token: str | None, repo: str, timeout: float = 30):
-        self.token = token
         self.repo = repo
+        self.can_file_issues = token is not None
         self.requests_url = f"https://github.com/{repo}/issues?q=is%3Aopen+label%3A{FEATURE_LABEL}"
-        headers = {
-            "Accept": "application/vnd.github+json",
-            "X-GitHub-Api-Version": "2022-11-28",
-        }
+        # The repo is public, so reading commits works without a token, at a lower rate limit.
+        headers = {"Accept": "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28"}
         if token:
             headers["Authorization"] = f"Bearer {token}"
-        self._http = httpx.AsyncClient(
-            base_url="https://api.github.com",
-            timeout=timeout,
-            headers=headers,
-        )
+        self._http = httpx.AsyncClient(base_url="https://api.github.com", timeout=timeout, headers=headers)
 
     async def close(self) -> None:
         await self._http.aclose()
@@ -131,22 +132,18 @@ class GitHubIssues:
         except (httpx.HTTPError, ValueError, KeyError, TypeError) as e:
             raise GitHubError(f"{type(e).__name__}: {e}") from e
 
-    async def recent_commits(self, sha: str = "master", per_page: int = MAX_ANNOUNCED_COMMITS + 1) -> list[Commit]:
-        """The newest commits on `sha`, newest first. Works without a token on public repos."""
+    async def compare(self, base: str, head: str) -> Comparison | None:
+        """What head has that base doesn't. None if GitHub doesn't know base, like after a force-push.
+
+        A rollback (head behind base) has no commits.
+        """
         try:
-            resp = await self._http.get(
-                f"/repos/{self.repo}/commits", params={"sha": sha, "per_page": per_page}
-            )
+            resp = await self._http.get(f"/repos/{self.repo}/compare/{base}...{head}")
+            if resp.status_code == 404:
+                return None
             resp.raise_for_status()
             data = resp.json()
-            if not isinstance(data, list):
-                raise TypeError("commits response is not a list")
-            return [
-                Commit(sha=str(item["sha"]), message=str(item["commit"]["message"]).strip())
-                for item in data
-            ]
+            commits = [Commit(str(c["sha"]), str(c["commit"]["message"]).strip()) for c in data["commits"]]
+            return Comparison(tuple(reversed(commits)), int(data["ahead_by"]))
         except (httpx.HTTPError, ValueError, KeyError, TypeError) as e:
             raise GitHubError(f"{type(e).__name__}: {e}") from e
-
-
-GitHubClient = GitHubIssues
