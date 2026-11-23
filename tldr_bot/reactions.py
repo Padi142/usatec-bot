@@ -17,6 +17,9 @@ IMAGE_TYPES = frozenset({"image/jpeg", "image/png", "image/webp"})
 MAX_IMAGES = 4
 # Signal compresses photos well below this. Larger ones are skipped, not judged slowly.
 MAX_IMAGE_BYTES = 5_000_000
+# Downloading and describing a message's pictures together. Reactions run one at a time,
+# so a stuck download would hold up every other message.
+PICTURE_TIMEOUT = 30.0
 
 # Most messages should get no reaction, so the label for them can't be a rule's emoji.
 NO_REACTION = "none"

@@ -280,11 +280,19 @@ class SignalClient:
         )
         resp.raise_for_status()
 
-    async def attachment(self, attachment_id: str) -> bytes:
-        """The contents of an attachment signal-cli has downloaded."""
-        resp = await self._http.get(f"/v1/attachments/{attachment_id}")
-        resp.raise_for_status()
-        return resp.content
+    async def attachment(self, attachment_id: str, max_bytes: int) -> bytes | None:
+        """The contents of an attachment signal-cli has downloaded, or None if it's over max_bytes.
+
+        The download stops as soon as it passes max_bytes.
+        """
+        async with self._http.stream("GET", f"/v1/attachments/{attachment_id}") as resp:
+            resp.raise_for_status()
+            data = bytearray()
+            async for chunk in resp.aiter_bytes():
+                data += chunk
+                if len(data) > max_bytes:
+                    return None
+            return bytes(data)
 
     async def sticker_pack_key(self, pack_id: str) -> str | None:
         """The hex key of a sticker pack the account has seen, or None if it hasn't."""

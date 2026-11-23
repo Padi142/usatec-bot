@@ -25,6 +25,7 @@ from tldr_bot.bot import (
     format_models,
     resolve_since_time,
 )
+from tldr_bot import bot as bot_module
 from tldr_bot.cats import CatClient, CatError, CatGenClient
 from tldr_bot.config import Config, normalize_group_id
 from tldr_bot.features import (
@@ -431,6 +432,12 @@ async def test_llm_describe_images():
     llm._http._transport = httpx.MockTransport(handler)
     assert await llm.describe_images([("image/jpeg", b"JPEG")], "gemma4") == "A black cat."
 
+    llm._http._transport = httpx.MockTransport(
+        lambda r: httpx.Response(200, json={"choices": [{"message": {"content": [{"type": "text"}]}}]})
+    )
+    with pytest.raises(LLMError):
+        await llm.describe_images([("image/jpeg", b"JPEG")], "gemma4")
+
 
 async def test_llm_summarize_strips_think():
     def handler(request: httpx.Request):
@@ -613,10 +620,13 @@ class FakeSignal:
         self.reactions = []
         self.files = {}  # attachment id -> contents; others fail to download
 
-    async def attachment(self, attachment_id):
+    async def attachment(self, attachment_id, max_bytes):
         if attachment_id not in self.files:
             raise httpx.HTTPStatusError("missing", request=httpx.Request("GET", "http://x"), response=httpx.Response(404))
-        return self.files[attachment_id]
+        data = self.files[attachment_id]
+        if isinstance(data, asyncio.Event):  # a download that hangs until it's set
+            await data.wait()
+        return data if len(data) <= max_bytes else None
 
     async def send_direct(self, recipient, text):
         self.direct.append((recipient, text))
@@ -1077,14 +1087,33 @@ async def test_failed_description_leaves_only_the_text():
     assert [state for state, _, _ in bot.llm.decisions] == ["look"]
 
 
-async def test_download_attachment_request():
+async def test_slow_pictures_leave_only_the_text(monkeypatch):
+    monkeypatch.setattr(bot_module, "PICTURE_TIMEOUT", 0.01)
+    bot = make_bot()
+    bot.signal.files = {"slow.jpg": asyncio.Event()}
+    bot.handle(envelope(group_data("look", ts=5, attachments=[photo("slow.jpg")])))
+    await finish_tasks(bot)
+    assert bot.llm.described == [] and [state for state, _, _ in bot.llm.decisions] == ["look"]
+
+
+async def test_download_attachment_stops_past_the_limit():
+    chunks_read = 0
+
+    async def body():
+        nonlocal chunks_read
+        for _ in range(10):
+            chunks_read += 1
+            yield b"x" * 100
+
     def handler(request: httpx.Request):
-        assert request.url.path == "/v1/attachments/cat.jpg"
-        return httpx.Response(200, content=b"JPEG")
+        assert request.url.path.startswith("/v1/attachments/")
+        return httpx.Response(200, content=body() if request.url.path.endswith("big.jpg") else b"JPEG")
 
     signal = SignalClient("http://signal", "+420999")
     signal._http._transport = httpx.MockTransport(handler)
-    assert await signal.attachment("cat.jpg") == b"JPEG"
+    assert await signal.attachment("cat.jpg", 4) == b"JPEG"
+    assert await signal.attachment("big.jpg", 250) is None
+    assert chunks_read == 3
 
 
 class FakeStickers:

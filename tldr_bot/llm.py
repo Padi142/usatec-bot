@@ -189,10 +189,12 @@ class LLMClient:
                 **({} if timeout is None else {"timeout": timeout}),
             )
             resp.raise_for_status()
-            content = resp.json()["choices"][0]["message"]["content"]
+            content = resp.json()["choices"][0]["message"]["content"] or ""
+            if not isinstance(content, str):
+                raise TypeError(f"content is a {type(content).__name__}, not text")
 
         # Reasoning models served locally often leak their chain of thought.
-        content = _THINK_RE.sub("", content or "").strip()
+        content = _THINK_RE.sub("", content).strip()
         if not content:
             raise LLMError("LLM returned an empty response")
         return content

@@ -29,6 +29,7 @@ from .reactions import (
     MAX_MESSAGE_CHARS,
     MAX_RULES,
     MAX_TOPIC_CHARS,
+    PICTURE_TIMEOUT,
     ReactAdd,
     ReactCommand,
     ReactRemove,
@@ -505,22 +506,28 @@ class TldrBot:
 
     async def _picture_description(self, msg: GroupMessage) -> str | None:
         """What the message's pictures show, or None without pictures or when that fails."""
+        try:
+            async with asyncio.timeout(PICTURE_TIMEOUT):
+                images = await self._download_pictures(msg)
+                return await self.llm.describe_images(images, self.cfg.vision_model) if images else None
+        except TimeoutError:
+            log.warning("Picture description took over %ss", PICTURE_TIMEOUT)
+        except LLMError as e:
+            log.warning("Picture description failed: %s", e)
+        return None
+
+    async def _download_pictures(self, msg: GroupMessage) -> list[tuple[str, bytes]]:
+        """The pictures to describe, as (content type, data). Failed and oversized ones are left out."""
         images: list[tuple[str, bytes]] = []
         for attachment in judged_images(msg.attachments):
             try:
-                data = await self.signal.attachment(attachment.id)
+                data = await self.signal.attachment(attachment.id, MAX_IMAGE_BYTES)
             except httpx.HTTPError as e:
                 log.warning("Attachment download failed: %s", e)
                 continue
-            if len(data) <= MAX_IMAGE_BYTES:
+            if data is not None:
                 images.append((attachment.content_type, data))
-        if not images:
-            return None
-        try:
-            return await self.llm.describe_images(images, self.cfg.vision_model)
-        except LLMError as e:
-            log.warning("Picture description failed: %s", e)
-            return None
+        return images
 
     async def _judged_text(self, msg: GroupMessage) -> str | None:
         """What the decision model reads: the typed text, or a sticker's emoji on its own."""
