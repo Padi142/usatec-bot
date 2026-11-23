@@ -46,6 +46,7 @@ from tldr_bot.health import heartbeat, is_healthy
 from tldr_bot.llm import STATUS_URL, Choice, LLMClient, LLMError, ModelInfo
 from tldr_bot.reactions import (
     DEFAULT_RULES,
+    MAX_DESCRIPTION_CHARS,
     MAX_IMAGE_BYTES,
     MAX_IMAGES,
     MAX_TOPIC_CHARS,
@@ -1073,11 +1074,34 @@ async def test_pictures_are_judged_by_their_description():
     bot.handle(envelope(group_data("look", ts=6, attachments=[photo("dog.png", "image/png")])))
     await finish_tasks(bot)
 
+    # One vision call per message serves both the stored text and the reaction decision.
     assert bot.llm.described == [[("image/jpeg", b"JPEG")], [("image/png", b"PNG")]]
+    assert [m.text for m in bot.store.last_before(GROUP, 100, 100)] == [
+        "[image: A black cat.]", "[image: A black cat.] look",
+    ]
     assert [state for state, _, _ in bot.llm.decisions] == [
         "[picture: A black cat.]", "look\n[picture: A black cat.]",
     ]
     assert bot.signal.reactions == [(GROUP, "🐈", "+420111", 5), (GROUP, "🐈", "+420111", 6)]
+
+
+async def test_picture_descriptions_reach_tldr_even_without_reaction_rules():
+    bot = make_bot()
+    bot.store.set_setting("reaction_rules", "[]")
+    bot.signal.files = {"shot.png": b"PNG", "long.jpg": b"JPEG"}
+    bot.llm.description = "Screenshot: Exam moved to Friday."
+    bot.handle(envelope(group_data("fyi", ts=1, attachments=[photo("shot.png", "image/png")])))
+    await finish_tasks(bot)
+
+    bot.llm.description = "x" * (MAX_DESCRIPTION_CHARS + 50)
+    bot.handle(envelope(group_data(None, ts=2, attachments=[photo("long.jpg")])))
+    await finish_tasks(bot)
+
+    await send_command(bot, "/tldr", 3)
+    assert len(bot.llm.described) == 2 and bot.llm.decisions == []
+    transcript = bot.llm.transcripts[0]
+    assert "[image: Screenshot: Exam moved to Friday.] fyi" in transcript
+    assert f"[image: {'x' * MAX_DESCRIPTION_CHARS}]" in transcript
 
 
 async def test_only_the_first_few_readable_pictures_are_described():
@@ -1102,6 +1126,7 @@ async def test_attachment_without_a_readable_picture_gets_no_decision(attachment
     bot.handle(envelope(group_data(None, ts=5, attachments=[attachment])))
     await finish_tasks(bot)
     assert bot.llm.described == [] and bot.llm.decisions == []
+    assert [m.text for m in bot.store.last_before(GROUP, 100, 100)] == ["[attachment]"]
 
 
 async def test_failed_description_leaves_only_the_text():
@@ -1112,6 +1137,7 @@ async def test_failed_description_leaves_only_the_text():
     bot.handle(envelope(group_data("look", ts=6, attachments=[photo("cat.jpg")])))
     await finish_tasks(bot)
     assert [state for state, _, _ in bot.llm.decisions] == ["look"]
+    assert [m.text for m in bot.store.last_before(GROUP, 100, 100)] == ["[attachment]", "[attachment] look"]
 
 
 async def test_slow_pictures_leave_only_the_text(monkeypatch):
@@ -1121,6 +1147,7 @@ async def test_slow_pictures_leave_only_the_text(monkeypatch):
     bot.handle(envelope(group_data("look", ts=5, attachments=[photo("slow.jpg")])))
     await finish_tasks(bot)
     assert bot.llm.described == [] and [state for state, _, _ in bot.llm.decisions] == ["look"]
+    assert [m.text for m in bot.store.last_before(GROUP, 100, 100)] == ["[attachment] look"]
 
 
 async def test_download_attachment_stops_past_the_limit():

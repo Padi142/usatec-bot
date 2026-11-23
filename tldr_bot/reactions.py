@@ -12,11 +12,12 @@ MAX_TOPIC_CHARS = 200
 # Only the start of a long message is judged, which is plenty to find its topic.
 MAX_MESSAGE_CHARS = 2000
 
-# Pictures the vision model describes for the decision model. Signal sends GIFs as video.
+# Pictures the vision model describes for /tldr and the decision model. Signal sends GIFs as video.
 IMAGE_TYPES = frozenset({"image/jpeg", "image/png", "image/webp"})
 MAX_IMAGES = 4
 # Signal compresses photos well below this. Larger ones are skipped, not judged slowly.
 MAX_IMAGE_BYTES = 5_000_000
+MAX_DESCRIPTION_CHARS = 1000
 # Downloading and describing a message's pictures together. Reactions run one at a time,
 # so a stuck download would hold up every other message.
 PICTURE_TIMEOUT = 30.0

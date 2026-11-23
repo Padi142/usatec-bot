@@ -25,6 +25,7 @@ from .features import (
 from .llm import LLMClient, LLMError, ModelInfo
 from .reactions import (
     INSTRUCTIONS,
+    MAX_DESCRIPTION_CHARS,
     MAX_IMAGE_BYTES,
     MAX_MESSAGE_CHARS,
     MAX_RULES,
@@ -349,6 +350,7 @@ class TldrBot:
             case GroupDelete():
                 self.store.delete(event.group_id, event.sender_id, event.target_timestamp)
             case GroupEdit():
+                # Replaces the stored text as a whole, which drops any [image: ...] description.
                 text = render_mentions(event.text, event.mentions, self.store.display_name)
                 self.store.edit(event.group_id, event.sender_id, event.target_timestamp, text)
             case GroupMessage() if is_macka_command(event.text):
@@ -610,13 +612,10 @@ class TldrBot:
         return load_rules(self.store.setting(REACTION_RULES_SETTING))
 
     def _queue_reaction(self, msg: GroupMessage) -> None:
-        # Other attachments, like files and videos, have nothing to judge.
-        judgeable = (
-            bool(msg.body)
-            or bool(judged_images(msg.attachments))
-            or (msg.sticker is not None and self.stickers is not None)
-        )
-        if not judgeable or not self.reaction_rules:
+        # Other attachments, like files and videos, have nothing to describe or judge.
+        has_pictures = bool(judged_images(msg.attachments))
+        has_text = bool(msg.body) or (msg.sticker is not None and self.stickers is not None)
+        if not has_pictures and not (has_text and self.reaction_rules):
             return
         if self._pending_reactions >= MAX_PENDING_REACTIONS:
             log.warning("Too many pending reactions, skipping a message")
@@ -634,9 +633,20 @@ class TldrBot:
             self._pending_reactions -= 1
 
     async def _react(self, msg: GroupMessage) -> None:
-        """React if the message matches a rule. A failure only costs the reaction, the chat sees nothing."""
+        """Describe the message's pictures for /tldr, and react if it matches a rule."""
+        description = await self._picture_description(msg)
+        if description is not None:
+            text = render_mentions(msg.text, msg.mentions, self.store.display_name)
+            self.store.edit(
+                msg.group_id,
+                msg.sender_id,
+                msg.timestamp,
+                text.replace("[attachment]", f"[image: {description}]", 1),
+            )
         rules = self.reaction_rules
-        state = judged_state(await self._judged_text(msg), await self._picture_description(msg))
+        if not rules:
+            return
+        state = judged_state(await self._judged_text(msg), description)
         if not state:
             return
         try:
@@ -655,7 +665,10 @@ class TldrBot:
         try:
             async with asyncio.timeout(PICTURE_TIMEOUT):
                 images = await self._download_pictures(msg)
-                return await self.llm.describe_images(images, self.cfg.vision_model) if images else None
+                if not images:
+                    return None
+                description = (await self.llm.describe_images(images, self.cfg.vision_model)).strip()
+                return description[:MAX_DESCRIPTION_CHARS] or None
         except TimeoutError:
             log.warning("Picture description took over %ss", PICTURE_TIMEOUT)
         except LLMError as e:
