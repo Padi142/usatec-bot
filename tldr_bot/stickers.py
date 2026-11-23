@@ -14,7 +14,6 @@ import logging
 import os
 import ssl
 from collections.abc import Iterator
-from dataclasses import dataclass
 
 import httpx
 from PIL import Image
@@ -132,8 +131,10 @@ def first_frame_png(data: bytes) -> bytes:
             out = io.BytesIO()
             image.convert("RGBA").save(out, "PNG")  # converting reads the first frame only
             return out.getvalue()
-    except (OSError, ValueError, Image.DecompressionBombError) as e:
-        raise StickerError(f"Sticker isn't a readable picture: {e}") from e
+    except StickerError:
+        raise
+    except Exception as e:  # Pillow's decoders fail in many ways on hostile files, like IndexError
+        raise StickerError(f"Sticker isn't a readable picture: {type(e).__name__}: {e}") from e
 
 
 def _varint(data: bytes, pos: int) -> tuple[int, int]:
@@ -217,16 +218,10 @@ def build_manifest(title: str, author: str, emojis: list[str], content_type: str
     return pack
 
 
-@dataclass(frozen=True)
-class _Pack:
-    key: bytes
-    emojis: dict[int, str]  # sticker id to emoji
-
-
 class Stickers:
     """Reads the stickers people send: their emoji and their picture.
 
-    Each pack's key and manifest are fetched once, then kept in memory.
+    Each pack's key and emojis are fetched once, then kept in memory.
     """
 
     def __init__(self, signal: SignalClient):
@@ -234,27 +229,29 @@ class Stickers:
         self._cdn = httpx.AsyncClient(
             base_url=SIGNAL_CDN, verify=ssl.create_default_context(cadata=SIGNAL_CA), timeout=15,
         )
-        self._packs: dict[str, _Pack] = {}
+        self._keys: dict[str, bytes] = {}
+        self._emojis: dict[str, dict[int, str]] = {}  # pack id to sticker id to emoji
 
     async def close(self) -> None:
         await self._cdn.aclose()
 
     async def emoji(self, sticker: Sticker) -> str | None:
         """The sticker's emoji, or None if its pack doesn't name one. Raises StickerError."""
-        return (await self._pack(sticker.pack_id)).emojis.get(sticker.sticker_id)
+        if sticker.pack_id not in self._emojis:
+            key = await self._key(sticker.pack_id)
+            manifest = await self._download(f"/stickers/{sticker.pack_id}/manifest.proto", MAX_STICKER_DOWNLOAD)
+            self._emojis[sticker.pack_id] = parse_emojis(decrypt(manifest, key))
+        return self._emojis[sticker.pack_id].get(sticker.sticker_id)
 
     async def picture(self, sticker: Sticker) -> bytes:
         """The sticker's picture as a PNG. Raises StickerError."""
-        pack = await self._pack(sticker.pack_id)
+        key = await self._key(sticker.pack_id)
         data = await self._download(f"/stickers/{sticker.pack_id}/full/{sticker.sticker_id}", MAX_STICKER_DOWNLOAD)
-        return first_frame_png(decrypt(data, pack.key))
+        return first_frame_png(decrypt(data, key))
 
-    async def _pack(self, pack_id: str) -> _Pack:
-        if pack_id not in self._packs:
-            self._packs[pack_id] = await self._load_pack(pack_id)
-        return self._packs[pack_id]
-
-    async def _load_pack(self, pack_id: str) -> _Pack:
+    async def _key(self, pack_id: str) -> bytes:
+        if pack_id in self._keys:
+            return self._keys[pack_id]
         try:
             pack_key = await self._signal.sticker_pack_key(pack_id)
             if pack_key is None:
@@ -265,11 +262,10 @@ class Stickers:
         if pack_key is None:
             raise StickerError(f"Signal doesn't know the key of sticker pack {pack_id}")
         try:
-            key = bytes.fromhex(pack_key)
+            self._keys[pack_id] = bytes.fromhex(pack_key)
         except ValueError as e:
             raise StickerError(f"Sticker pack {pack_id} has an invalid key") from e
-        manifest = await self._download(f"/stickers/{pack_id}/manifest.proto", MAX_STICKER_DOWNLOAD)
-        return _Pack(key, parse_emojis(decrypt(manifest, key)))
+        return self._keys[pack_id]
 
     async def _download(self, path: str, max_bytes: int) -> bytes:
         """A file from Signal's CDN, read no further than max_bytes. Raises StickerError."""

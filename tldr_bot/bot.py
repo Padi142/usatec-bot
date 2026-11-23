@@ -112,6 +112,8 @@ MAX_ANNOUNCEMENT_CHARS = 1500
 MAX_PENDING_REACTIONS = 20
 # Sticker descriptions kept in memory. Each is a sentence, so this stays small.
 MAX_STICKER_DESCRIPTIONS = 1000
+# A sticker whose picture couldn't be described is judged by its emoji alone for this long.
+STICKER_RETRY_AFTER = 3600.0
 
 # Images the bot sent itself, kept so /sticker works on replies to them. They don't
 # come back as events, so there's no attachment id to fetch them by later.
@@ -351,8 +353,8 @@ class TldrBot:
         self._busy_models: set[str] = set()
         self._reaction_slot = asyncio.Semaphore(1)
         self._pending_reactions = 0
-        # Descriptions of stickers seen before, oldest first.
-        self._sticker_descriptions: dict[Sticker, str] = {}
+        # Stickers seen before, oldest first: the description, or None if it failed, and when.
+        self._sticker_descriptions: dict[Sticker, tuple[str | None, float]] = {}
 
     async def run(self) -> None:
         self._spawn(self.announce_updates())
@@ -754,27 +756,34 @@ class TldrBot:
 
     async def _picture_description(self, msg: GroupMessage) -> str | None:
         """What the message's pictures or sticker show, or None without any or when that fails."""
-        # The same stickers come up again and again, so each is described once.
+        # The same stickers come up again and again, so each is described once, and one that
+        # failed isn't tried again for a while.
         if msg.sticker is not None and (cached := self._sticker_descriptions.get(msg.sticker)) is not None:
-            return cached
+            description, at = cached
+            if description is not None or time.monotonic() - at < STICKER_RETRY_AFTER:
+                return description
+        description = await self._describe(msg)
+        if msg.sticker is not None:
+            self._sticker_descriptions.pop(msg.sticker, None)  # re-added as the newest
+            if len(self._sticker_descriptions) >= MAX_STICKER_DESCRIPTIONS:
+                del self._sticker_descriptions[next(iter(self._sticker_descriptions))]
+            self._sticker_descriptions[msg.sticker] = (description, time.monotonic())
+        return description
+
+    async def _describe(self, msg: GroupMessage) -> str | None:
+        """Download and describe the message's pictures or sticker. None when there's nothing or it fails."""
         try:
             async with asyncio.timeout(PICTURE_TIMEOUT):
                 images = await self._download_pictures(msg)
                 if not images:
                     return None
                 description = (await self.llm.describe_images(images, self.cfg.vision_model)).strip()
-                description = description[:MAX_DESCRIPTION_CHARS] or None
+                return description[:MAX_DESCRIPTION_CHARS] or None
         except TimeoutError:
             log.warning("Picture description took over %ss", PICTURE_TIMEOUT)
-            return None
         except LLMError as e:
             log.warning("Picture description failed: %s", e)
-            return None
-        if msg.sticker is not None and description is not None:
-            if len(self._sticker_descriptions) >= MAX_STICKER_DESCRIPTIONS:
-                del self._sticker_descriptions[next(iter(self._sticker_descriptions))]
-            self._sticker_descriptions[msg.sticker] = description
-        return description
+        return None
 
     async def _download_pictures(self, msg: GroupMessage) -> list[tuple[str, bytes]]:
         """The pictures to describe, as (content type, data). Failed and oversized ones are left out."""

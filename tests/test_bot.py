@@ -1307,6 +1307,46 @@ async def test_sticker_is_judged_by_whatever_can_be_read(emoji, picture, state):
     assert [s for s, _, _ in bot.llm.decisions] == ([state] if state else [])
 
 
+@pytest.mark.parametrize("retry_after, pictures", [(3600, 1), (0, 2)])
+async def test_failed_sticker_pictures_wait_before_a_retry(monkeypatch, retry_after, pictures):
+    monkeypatch.setattr(bot_module, "STICKER_RETRY_AFTER", retry_after)
+    bot = make_bot()
+    bot.stickers = FakeStickers("🙂", StickerError("CDN down"))
+    bot.handle(envelope(sticker_data(ts=5)))
+    await finish_tasks(bot)
+    bot.handle(envelope(sticker_data(ts=6)))
+    await finish_tasks(bot)
+    assert bot.stickers.pictures == pictures
+    assert [state for state, _, _ in bot.llm.decisions] == ["🙂", "🙂"]
+
+
+async def test_sticker_picture_does_not_need_the_manifest():
+    key = bytes.fromhex(BANDIT_PACK_KEY)
+
+    def cdn(request: httpx.Request):
+        if request.url.path.endswith("manifest.proto"):
+            return httpx.Response(503)
+        return httpx.Response(200, content=encrypt(png(), key))
+
+    lookup = Stickers(FakePackKeys())
+    lookup._cdn._transport = httpx.MockTransport(cdn)
+    assert (await lookup.picture(Sticker(BANDIT_PACK_ID, 4))).startswith(b"\x89PNG")
+    with pytest.raises(StickerError, match="503"):
+        await lookup.emoji(Sticker(BANDIT_PACK_ID, 4))
+
+
+def test_any_unreadable_sticker_picture_is_a_sticker_error(monkeypatch):
+    with pytest.raises(StickerError, match="readable"):
+        stickers_module.first_frame_png(b"{lottie json}")
+
+    def broken_decoder(*args):  # Pillow's decoders fail with IndexError and the like on hostile files
+        raise IndexError("list index out of range")
+
+    monkeypatch.setattr(stickers_module.Image, "open", broken_decoder)
+    with pytest.raises(StickerError, match="IndexError"):
+        stickers_module.first_frame_png(png())
+
+
 def animated_webp():
     out = io.BytesIO()
     frames = [Image.new("RGB", (8, 8), color) for color in ("red", "blue")]
