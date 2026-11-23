@@ -1,10 +1,13 @@
 import asyncio
+import json
 import logging
 import re
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
+
+import httpx
 
 from .cats import GRID_LAYOUTS, CatClient, CatError, CatGenClient
 from .config import Config
@@ -35,8 +38,23 @@ from .signal_api import (
     GroupEdit,
     GroupMessage,
     SignalClient,
+    Sticker,
     parse_event,
     render_mentions,
+)
+from .sticker_pack import (
+    DEFAULT_EMOJI,
+    MAX_STICKERS,
+    PackRef,
+    StickerAdd,
+    StickerCommand,
+    StickerPackUploader,
+    StickerRateLimited,
+    StickerRemove,
+    StickerUploadError,
+    StickerUsage,
+    make_sticker,
+    parse_sticker_command,
 )
 from .stickers import StickerEmojis, StickerError
 from .store import ChatMessage, MessageStore
@@ -61,6 +79,17 @@ REACTION_RULES_SETTING = "reaction_rules"
 # one at a time. Past this many waiting, for example during an outage, new messages
 # get no reaction rather than a late one.
 MAX_PENDING_REACTIONS = 20
+
+# Settings key for the current version of the shared sticker pack, as JSON.
+STICKER_PACK_SETTING = "sticker_pack"
+# Images the bot sent itself, kept so /sticker works on replies to them. They don't
+# come back as events, so there's no attachment id to fetch them by later.
+MAX_OWN_IMAGES = 50
+
+STICKER_USAGE = (
+    "Reply to an image with /sticker or /sticker 😺 to add it to the sticker pack.\n"
+    "/sticker remove 3 removes the third sticker."
+)
 
 REACT_USAGE = (
     "/react add <emoji> <topic> adds a rule, or adds words to a rule that emoji already has.\n"
@@ -260,6 +289,7 @@ class TldrBot:
         cats: CatClient,
         cat_gen: CatGenClient | None = None,
         stickers: StickerEmojis | None = None,  # None means stickers get no reactions
+        sticker_packs: StickerPackUploader | None = None,  # None means /sticker is disabled
     ):
         self.cfg = cfg
         self.store = store
@@ -268,7 +298,12 @@ class TldrBot:
         self.cats = cats
         self.cat_gen = cat_gen
         self.stickers = stickers
+        self.sticker_packs = sticker_packs
         self._tasks: set[asyncio.Task] = set()
+        # Pack edits read the pack and upload a new one, so they take turns.
+        self._sticker_lock = asyncio.Lock()
+        # Timestamp to image, oldest first.
+        self._own_images: dict[int, bytes] = {}
         # Models with a summary running. Each runs one at a time, across all groups.
         self._busy_models: set[str] = set()
         self._reaction_slot = asyncio.Semaphore(1)
@@ -313,6 +348,11 @@ class TldrBot:
             )) is not None:
                 log.info("/prompt from %s in group %s", event.sender_name, event.group_id)
                 self._spawn(self.run_prompt(event, prompt_command))
+            case GroupMessage() if (sticker_command := parse_sticker_command(
+                render_mentions(event.body or "", event.mentions, self.store.display_name)
+            )) is not None:
+                log.info("/sticker from %s in group %s", event.sender_name, event.group_id)
+                self._spawn(self.run_sticker(event, sticker_command))
             case GroupMessage() if (react_command := parse_react_command(event.text)) is not None:
                 log.info("/react from %s in group %s", event.sender_name, event.group_id)
                 self._spawn(self.run_react_command(event, react_command))
@@ -323,6 +363,8 @@ class TldrBot:
                     self.store.add(
                         ChatMessage(event.group_id, event.sender_id, event.sender_name, event.timestamp, text)
                     )
+                    if event.image:
+                        self.store.add_image(event.group_id, event.sender_id, event.timestamp, event.image)
                     self._queue_reaction(event)
                 else:
                     log.info("/tldr from %s in group %s", event.sender_name, event.group_id)
@@ -349,16 +391,26 @@ class TldrBot:
         task.add_done_callback(self._tasks.discard)
 
     async def reply(
-        self, to: GroupMessage, text: str, attachments: list[tuple[str, bytes]] | None = None
+        self,
+        to: GroupMessage,
+        text: str,
+        attachments: list[tuple[str, bytes]] | None = None,
+        sticker: Sticker | None = None,
     ) -> None:
-        await self.signal.send_group(
+        timestamp = await self.signal.send_group(
             to.group_id,
             text,
             quote_timestamp=to.timestamp,
             quote_author=to.sender_number or to.sender_id,
             quote_text=to.text,
             attachments=attachments,
+            sticker=sticker,
         )
+        image = next((data for content_type, data in attachments or [] if content_type.startswith("image/")), None)
+        if timestamp is not None and image is not None:
+            self._own_images[timestamp] = image
+            while len(self._own_images) > MAX_OWN_IMAGES:
+                del self._own_images[next(iter(self._own_images))]
 
     async def run_macka(self, msg: GroupMessage) -> None:
         try:
@@ -396,6 +448,115 @@ class TldrBot:
             await self.reply(msg, "🐈", attachments=[cat])
         except Exception:
             log.exception("/mackagen failed")
+
+    @property
+    def sticker_pack(self) -> PackRef | None:
+        """The current version of the shared sticker pack, if it has any stickers."""
+        raw = self.store.setting(STICKER_PACK_SETTING)
+        return PackRef(**json.loads(raw)) if raw else None
+
+    def _save_sticker_pack(self, pack: PackRef | None) -> None:
+        self.store.set_setting(STICKER_PACK_SETTING, json.dumps(asdict(pack)) if pack else None)
+
+    def _sticker_usage(self) -> str:
+        pack, count = self.sticker_pack, self.store.sticker_count()
+        if pack is None:
+            return f"{STICKER_USAGE}\n\nThe pack is empty."
+        return f"{STICKER_USAGE}\n\nThe pack has {count} of {MAX_STICKERS} stickers:\n{pack.url}"
+
+    async def run_sticker(self, msg: GroupMessage, command: StickerCommand) -> None:
+        try:
+            if (text := await self._sticker_command(msg, command)) is not None:
+                await self.reply(msg, text)
+        except Exception:
+            log.exception("/sticker failed")
+
+    async def _sticker_command(self, msg: GroupMessage, command: StickerCommand) -> str | None:
+        """Carry out a /sticker command. Returns what to tell the sender, or None if the bot replied already."""
+        if self.sticker_packs is None:
+            return "Stickers aren't set up (SIGNAL_CLI_DIR is missing)."
+        try:
+            match command:
+                case StickerUsage():
+                    return self._sticker_usage()
+                case StickerAdd(emoji=emoji):
+                    return await self._add_sticker(msg, emoji)
+                case StickerRemove(position=position):
+                    return await self._remove_sticker(position)
+        except StickerRateLimited:
+            return "Signal only lets me upload about 20 sticker packs a day, try again later."
+        except StickerUploadError as e:
+            log.error("Sticker pack upload failed: %s", e)
+            return "Sorry, I couldn't upload the sticker pack right now."
+
+    async def _add_sticker(self, msg: GroupMessage, emoji: str | None) -> str | None:
+        if emoji is not None and not is_emoji(emoji):
+            return f"{emoji} isn't an emoji.\n\n{STICKER_USAGE}"
+        if msg.image is None and msg.quote is None:
+            return self._sticker_usage()
+        assert self.sticker_packs is not None
+        await self.signal.set_typing(msg.group_id, True)
+        try:
+            async with self._sticker_lock:
+                if self.store.sticker_count() >= MAX_STICKERS:
+                    return f"The pack is full, it has {MAX_STICKERS} stickers. /sticker remove <n> makes room."
+                image = await self._sticker_source(msg)
+                if image is None:
+                    return "I can't find that image. I only know images sent while I'm running."
+                try:
+                    sticker = await asyncio.to_thread(make_sticker, image)
+                except StickerError as e:
+                    log.warning("Sticker conversion failed: %s", e)
+                    return "I couldn't turn that into a sticker."
+                sticker_id = self.store.add_sticker(sticker, emoji or DEFAULT_EMOJI)
+                stickers = self.store.stickers()
+                try:
+                    pack = await self.sticker_packs.upload(stickers)
+                except Exception:
+                    self.store.remove_sticker(sticker_id)
+                    raise
+                self._save_sticker_pack(pack)
+        finally:
+            await self.signal.set_typing(msg.group_id, False)
+        position = next(i for i, s in enumerate(stickers) if s.id == sticker_id)
+        # The sticker itself is the reply. Tapping it opens the new pack, ready to install.
+        try:
+            await self.signal.install_sticker_pack(pack.pack_id, pack.pack_key)
+            await self.reply(msg, "", sticker=Sticker(pack.pack_id, position))
+            return None
+        except httpx.HTTPError as e:
+            log.warning("Sending the new sticker failed: %s", e)
+            return f"Added as sticker {position + 1}:\n{pack.url}"
+
+    async def _sticker_source(self, msg: GroupMessage) -> bytes | None:
+        """The image a /sticker message is about: its own image, or the one it replies to."""
+        attachment_id = msg.image
+        if attachment_id is None and msg.quote is not None:
+            if (own := self._own_images.get(msg.quote.timestamp)) is not None:
+                return own
+            attachment_id = self.store.image(msg.group_id, msg.quote.author_ids, msg.quote.timestamp)
+        if attachment_id is None:
+            return None
+        try:
+            return await self.signal.attachment(attachment_id)
+        except httpx.HTTPError as e:
+            log.warning("Image download failed: %s", e)
+            return None
+
+    async def _remove_sticker(self, position: int) -> str:
+        assert self.sticker_packs is not None
+        async with self._sticker_lock:
+            stickers = self.store.stickers()
+            if position > len(stickers):
+                return f"There's no sticker {position}, the pack has {len(stickers)}."
+            removed = stickers[position - 1]
+            remaining = [s for s in stickers if s.id != removed.id]
+            pack = await self.sticker_packs.upload(remaining) if remaining else None
+            self.store.remove_sticker(removed.id)
+            self._save_sticker_pack(pack)
+        if pack is None:
+            return "Removed the last sticker, the pack is empty now."
+        return f"Removed sticker {position}. The new pack:\n{pack.url}"
 
     @property
     def reaction_rules(self) -> tuple[ReactionRule, ...]:

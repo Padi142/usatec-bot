@@ -1,4 +1,6 @@
 import asyncio
+import base64
+import io
 import json
 import os
 from datetime import datetime, timedelta
@@ -6,6 +8,7 @@ from pathlib import Path
 
 import httpx
 import pytest
+from PIL import Image
 
 from tldr_bot.bot import (
     LOCAL_TZ,
@@ -40,7 +43,27 @@ from tldr_bot.reactions import (
     is_emoji,
     parse_react_command,
 )
-from tldr_bot.stickers import StickerEmojis, StickerError, decrypt_manifest, parse_emojis
+from tldr_bot.sticker_pack import (
+    DEFAULT_EMOJI,
+    PackRef,
+    StickerAdd,
+    StickerPackUploader,
+    StickerRateLimited,
+    StickerRemove,
+    StickerUploadError,
+    StickerUsage,
+    account_credentials,
+    make_sticker,
+    parse_sticker_command,
+)
+from tldr_bot.stickers import (
+    StickerEmojis,
+    StickerError,
+    build_manifest,
+    decrypt_manifest,
+    encrypt,
+    parse_emojis,
+)
 from tldr_bot import stickers as stickers_module
 from tldr_bot.signal_api import (
     DirectMessage,
@@ -49,12 +72,13 @@ from tldr_bot.signal_api import (
     GroupEdit,
     GroupMessage,
     Mention,
+    Quote,
     SignalClient,
     parse_event,
     render_mentions,
     to_rest_group_id,
 )
-from tldr_bot.store import ChatMessage, MessageStore
+from tldr_bot.store import ChatMessage, MessageStore, PackSticker
 
 GROUP = "abcDEF123+/="
 
@@ -583,6 +607,7 @@ class FakeSignal:
 
     async def send_group(self, group_id, text, **kwargs):
         self.sent.append((group_id, text, kwargs))
+        return 10_000 + len(self.sent)
 
     async def set_typing(self, group_id, typing):
         pass
@@ -1330,3 +1355,244 @@ def test_stale_heartbeat(tmp_path):
     assert is_healthy(path)
     os.utime(path, (0, 0))
     assert not is_healthy(path)
+
+
+# --- /sticker -----------------------------------------------------------------
+
+def png(width=40, height=20, color=(255, 0, 0, 255)) -> bytes:
+    out = io.BytesIO()
+    Image.new("RGBA", (width, height), color).save(out, "PNG")
+    return out.getvalue()
+
+
+@pytest.mark.parametrize("text, expected", [
+    ("/sticker", StickerAdd()),
+    ("/STICKER 😺 ", StickerAdd("😺")),
+    ("/sticker remove 3", StickerRemove(3)),
+    ("/sticker remove", StickerUsage()),
+    ("/sticker remove 0", StickerUsage()),
+    ("/sticker 😺 extra", StickerUsage()),
+    ("/stickers", None),
+])
+def test_parse_sticker_command(text, expected):
+    assert parse_sticker_command(text) == expected
+
+
+def test_parse_image_and_quote():
+    data = group_data(
+        "/sticker",
+        attachments=[{"contentType": "video/mp4", "id": "v.mp4"}, {"contentType": "image/jpeg", "id": "a.jpg"}],
+        quote={"id": 7, "authorUuid": "uuid-bob", "authorNumber": "+420222", "text": ""},
+    )
+    ev = parse_event(envelope(data))
+    assert ev.image == "a.jpg" and ev.quote == Quote(7, ("uuid-bob", "+420222"))
+    assert parse_event(envelope(group_data("hi"))).quote is None
+
+
+def test_built_pack_files_decrypt_and_parse():
+    key = bytes(range(32))
+    manifest = build_manifest("Title", "Author", ["😺", "🐦"], "image/webp")
+    assert parse_emojis(decrypt_manifest(encrypt(manifest, key), key)) == {0: "😺", 1: "🐦"}
+
+
+def test_make_sticker_fits_any_image_into_512_square():
+    sticker = Image.open(io.BytesIO(make_sticker(png(40, 20))))
+    assert sticker.format == "WEBP" and sticker.size == (512, 512)
+    # Scaled up to the full width and centered, with transparent bands above and below.
+    red, green, _, alpha = sticker.getpixel((256, 256))
+    assert red > 240 and green < 15 and alpha == 255 and sticker.getpixel((256, 10))[3] == 0
+    with pytest.raises(StickerError):
+        make_sticker(b"not an image")
+
+
+def write_account(tmp_path, device_id):
+    data = tmp_path / "data"
+    data.mkdir()
+    (data / "accounts.json").write_text(json.dumps({"accounts": [
+        {"path": "123", "environment": "LIVE", "number": "+420999", "uuid": "aci-1"},
+    ]}))
+    (data / "123").write_text(json.dumps({"password": "pw", "deviceId": device_id}))
+
+
+@pytest.mark.parametrize("device_id, username", [(1, "aci-1"), (3, "aci-1.3")])
+def test_account_credentials(tmp_path, device_id, username):
+    write_account(tmp_path, device_id)
+    assert account_credentials(tmp_path, "+420999") == (username, "pw")
+    with pytest.raises(StickerUploadError, match="no account"):
+        account_credentials(tmp_path, "+420000")
+
+
+def upload_form(key):
+    return {"key": key, "credential": "c", "acl": "private", "algorithm": "a", "date": "d", "policy": "p",
+            "signature": "s"}
+
+
+async def test_upload_puts_every_file_with_its_signed_form(tmp_path):
+    write_account(tmp_path, 1)
+    pack_id = "ab" * 16
+    uploads: dict[str, bytes] = {}
+
+    def service(request: httpx.Request):
+        assert request.url.path == "/v1/sticker/pack/form/2"
+        assert request.headers["authorization"] == "Basic " + base64.b64encode(b"aci-1:pw").decode()
+        return httpx.Response(200, json={
+            "packId": pack_id,
+            "manifest": upload_form(f"stickers/{pack_id}/manifest.proto") | {"id": -1},
+            "stickers": [upload_form(f"stickers/{pack_id}/full/{i}") | {"id": i} for i in (1, 0)],
+        })
+
+    def cdn(request: httpx.Request):
+        body = request.content
+        # The file comes last, after the signed fields.
+        assert body.index(b'name="policy"') < body.index(b'name="file"')
+        key = body.split(b'name="key"\r\n\r\n')[1].split(b"\r\n")[0].decode()
+        uploads[key] = body.split(b"Content-Type: application/octet-stream\r\n\r\n")[1].rsplit(b"\r\n--", 1)[0]
+        return httpx.Response(204)
+
+    uploader = StickerPackUploader(str(tmp_path), "+420999")
+    uploader._service._transport = httpx.MockTransport(service)
+    uploader._cdn._transport = httpx.MockTransport(cdn)
+    pack = await uploader.upload([PackSticker(5, b"first", "😺"), PackSticker(9, b"second", "🐦")])
+
+    assert pack.pack_id == pack_id and pack.url.startswith("https://signal.art/addstickers/#pack_id=")
+    key = bytes.fromhex(pack.pack_key)
+    manifest = decrypt_manifest(uploads[f"stickers/{pack_id}/manifest.proto"], key)
+    assert parse_emojis(manifest) == {0: "😺", 1: "🐦"}
+    assert decrypt_manifest(uploads[f"stickers/{pack_id}/full/1"], key) == b"second"
+
+
+async def test_upload_rate_limit(tmp_path):
+    write_account(tmp_path, 1)
+    uploader = StickerPackUploader(str(tmp_path), "+420999")
+    uploader._service._transport = httpx.MockTransport(lambda request: httpx.Response(429))
+    with pytest.raises(StickerRateLimited):
+        await uploader.upload([PackSticker(1, b"x", "😺")])
+
+
+def test_store_images_and_stickers():
+    store = MessageStore(":memory:", 1000)
+    store.add_image(GROUP, "uuid-bob", 7, "a.jpg")
+    assert store.image(GROUP, ("+420222", "uuid-bob"), 7) == "a.jpg"
+    assert store.image("other", ("uuid-bob",), 7) is None
+    store.delete(GROUP, "uuid-bob", 7)
+    assert store.image(GROUP, ("uuid-bob",), 7) is None
+
+    first = store.add_sticker(b"one", "😺")
+    store.add_sticker(b"two", "🐦")
+    store.remove_sticker(first)
+    assert [(s.image, s.emoji) for s in store.stickers()] == [(b"two", "🐦")] and store.sticker_count() == 1
+
+
+class FakePacks:
+    def __init__(self, error=None):
+        self.uploads: list[list[PackSticker]] = []
+        self.error = error
+
+    async def upload(self, stickers):
+        if self.error:
+            raise self.error
+        self.uploads.append(stickers)
+        return PackRef(f"{len(self.uploads):032x}", "00" * 32)
+
+
+class StickerSignal(FakeSignal):
+    def __init__(self):
+        super().__init__()
+        self.attachments = {"a.jpg": png()}
+        self.installed = []
+
+    async def attachment(self, attachment_id):
+        if attachment_id not in self.attachments:
+            raise httpx.HTTPStatusError("missing", request=httpx.Request("GET", "http://x"), response=httpx.Response(404))
+        return self.attachments[attachment_id]
+
+    async def install_sticker_pack(self, pack_id, pack_key):
+        self.installed.append(pack_id)
+
+
+def sticker_bot(packs=None):
+    bot = make_bot()
+    bot.signal = StickerSignal()
+    bot.sticker_packs = packs or FakePacks()
+    return bot
+
+
+def reply_to(text, ts, quote_ts, author="uuid-bob"):
+    return envelope(group_data(text, ts=ts, quote={"id": quote_ts, "authorUuid": author, "text": ""}))
+
+
+async def test_sticker_from_a_reply_to_an_image():
+    bot = sticker_bot()
+    bot.handle(envelope(group_data(None, ts=7, attachments=[{"contentType": "image/jpeg", "id": "a.jpg"}]),
+                        name="Bob", uuid="uuid-bob"))
+    bot.handle(reply_to("/sticker 😺", 8, 7))
+    await finish_tasks(bot)
+
+    [stickers] = bot.sticker_packs.uploads
+    assert [s.emoji for s in stickers] == ["😺"]
+    assert Image.open(io.BytesIO(stickers[0].image)).size == (512, 512)
+    pack = bot.sticker_pack
+    assert bot.signal.installed == [pack.pack_id]
+    # The reply is the new sticker, quoting the command.
+    _, text, kwargs = bot.signal.sent[-1]
+    assert text == "" and kwargs["sticker"] == Sticker(pack.pack_id, 0) and kwargs["quote_timestamp"] == 8
+    # The command isn't chat.
+    assert [m.timestamp for m in bot.store.last_before(GROUP, 100, 100)] == [7]
+
+
+async def test_sticker_from_an_image_with_the_command_as_caption_and_from_the_bots_own_image():
+    bot = sticker_bot()
+    bot.handle(envelope(group_data("/sticker", ts=1, attachments=[{"contentType": "image/png", "id": "a.jpg"}])))
+    await finish_tasks(bot)
+    # /macka sends a cat; a reply to it works even though the bot never received it.
+    bot.cats.random_cat = lambda: asyncio.sleep(0, ("image/png", png()))
+    await send_command(bot, "/macka", 2)
+    cat_ts = 10_000 + len(bot.signal.sent)
+    bot.signal.attachments.clear()
+    bot.handle(reply_to("/sticker 🐈", 3, cat_ts, author="uuid-bot"))
+    await finish_tasks(bot)
+    assert [s.emoji for s in bot.sticker_packs.uploads[-1]] == [DEFAULT_EMOJI, "🐈"]
+    assert bot.signal.sent[-1][2]["sticker"].sticker_id == 1
+
+
+async def test_sticker_remove_uploads_the_rest():
+    bot = sticker_bot()
+    bot.store.add_sticker(b"one", "😺")
+    bot.store.add_sticker(b"two", "🐦")
+    reply = await send_command(bot, "/sticker remove 1", 1)
+    assert reply.startswith("Removed sticker 1") and bot.sticker_pack.url in reply
+    assert [s.image for s in bot.sticker_packs.uploads[-1]] == [b"two"]
+    assert "no sticker 5" in await send_command(bot, "/sticker remove 5", 2)
+    assert "empty" in await send_command(bot, "/sticker remove 1", 3)
+    assert bot.sticker_pack is None and bot.store.sticker_count() == 0
+
+
+async def test_failed_upload_keeps_the_pack_as_it_was():
+    bot = sticker_bot(FakePacks(StickerUploadError("boom")))
+    bot.handle(envelope(group_data("/sticker", ts=1, attachments=[{"contentType": "image/png", "id": "a.jpg"}])))
+    await finish_tasks(bot)
+    assert "couldn't upload" in bot.signal.sent[-1][1]
+    assert bot.store.sticker_count() == 0 and bot.sticker_pack is None
+
+
+@pytest.mark.parametrize("text, expected", [
+    ("/sticker", "Reply to an image"),
+    ("/sticker abc", "isn't an emoji"),
+])
+async def test_sticker_usage(text, expected):
+    assert expected in await send_command(sticker_bot(), text, 1)
+
+
+async def test_sticker_explains_what_went_wrong():
+    bot = sticker_bot()
+    bot.handle(reply_to("/sticker", 2, 999))
+    await finish_tasks(bot)
+    assert "can't find that image" in bot.signal.sent[-1][1]
+
+    bot.signal.attachments["bad"] = b"not an image"
+    bot.handle(envelope(group_data("/sticker", ts=3, attachments=[{"contentType": "image/png", "id": "bad"}])))
+    await finish_tasks(bot)
+    assert "couldn't turn that into a sticker" in bot.signal.sent[-1][1]
+
+    bot.sticker_packs = None
+    assert "aren't set up" in await send_command(bot, "/sticker", 4)

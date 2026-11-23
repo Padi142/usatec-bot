@@ -73,6 +73,9 @@ class Config:
     cat_gen_api_key: str | None = None
     # Judges every group message. This has to be a decision model, not a chat model.
     reaction_model: str = "vllm-sr-d3-flash"
+    # signal-cli's data directory, for the account credentials /sticker uploads packs with.
+    # Without it, /sticker is disabled.
+    signal_cli_dir: str | None = None
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -94,4 +97,5 @@ class Config:
             ),
             cat_gen_api_key=os.environ.get("CAT_GEN_API_KEY") or None,
             reaction_model=os.environ.get("REACTION_MODEL") or cls.reaction_model,
+            signal_cli_dir=os.environ.get("SIGNAL_CLI_DIR") or None,
         )

@@ -56,6 +56,17 @@ with the `flowmatch-cats-tti` text-to-cat model. `/mackagen 2x2`, `/mackagen 3x3
 and `/mackagen 5x5` make a grid of 4, 9, 16 or 25 cats in one picture (only without a prompt). Generating takes around 20 seconds, and
 it needs `CAT_GEN_API_KEY` to be set.
 
+`/sticker` as a reply to an image adds it to the sticker pack all groups share, and the bot
+replies with the new sticker. Tap it to install the pack. `/sticker 😺` gives the sticker an emoji,
+and an image sent with `/sticker` as its caption works too. `/sticker remove 3` removes the third
+sticker, and `/sticker` on its own shows the pack's link.
+
+Signal sticker packs can't change, so each edit uploads the whole pack again as a new pack, and
+it has to be installed again to get the new stickers. Signal allows about 20 uploads a day. The
+REST API can't upload packs, so the bot does it itself, with the account credentials it reads
+from signal-cli's data volume. It only knows images sent while it was running, and the ones it
+sent itself since its last restart.
+
 ## How it works
 
 Signal has no API for fetching chat history, so the bot **saves every group

@@ -5,7 +5,7 @@ import base64
 import json
 import logging
 from collections.abc import AsyncIterator
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs, quote as quote_path, urlsplit
 from dataclasses import dataclass, field
 
 import httpx
@@ -31,6 +31,13 @@ class Sticker:
 
 
 @dataclass(frozen=True)
+class Quote:
+    """The message a reply quotes. Authors show up by UUID, number or both."""
+    timestamp: int
+    author_ids: tuple[str, ...]
+
+
+@dataclass(frozen=True)
 class GroupMessage:
     group_id: str
     sender_id: str
@@ -42,6 +49,9 @@ class GroupMessage:
     # What the sender typed, without the quote and attachment markers `text` has.
     body: str | None = None
     sticker: Sticker | None = None
+    # The attachment id of the message's first image, for GET /v1/attachments/{id}.
+    image: str | None = None
+    quote: Quote | None = None
 
 
 @dataclass(frozen=True)
@@ -101,6 +111,21 @@ def _sticker(data: dict) -> Sticker | None:
     pack_id, sticker_id = sticker.get("packId"), sticker.get("stickerId")
     if isinstance(pack_id, str) and isinstance(sticker_id, int):
         return Sticker(pack_id.lower(), sticker_id)
+    return None
+
+
+def _image(data: dict) -> str | None:
+    for attachment in data.get("attachments") or []:
+        if str(attachment.get("contentType", "")).startswith("image/") and isinstance(attachment.get("id"), str):
+            return attachment["id"]
+    return None
+
+
+def _quote(data: dict) -> Quote | None:
+    quote = data.get("quote") or {}
+    authors = tuple(a for a in (quote.get("authorUuid"), quote.get("authorNumber")) if isinstance(a, str) and a)
+    if isinstance(quote.get("id"), int) and authors:
+        return Quote(quote["id"], authors)
     return None
 
 
@@ -167,7 +192,7 @@ def parse_event(payload: dict) -> Event | None:
     timestamp = data.get("timestamp") or env.get("timestamp")
     return GroupMessage(
         group_id, sender_id, sender_name, sender_number, timestamp, text, _mentions(data), data.get("message"),
-        _sticker(data),
+        _sticker(data), _image(data), _quote(data),
     )
 
 
@@ -223,13 +248,19 @@ class SignalClient:
         quote_author: str | None = None,
         quote_text: str | None = None,
         attachments: list[tuple[str, bytes]] | None = None,
-    ) -> None:
-        """Send a group message. attachments are (content type, data) pairs."""
+        sticker: Sticker | None = None,
+    ) -> int | None:
+        """Send a group message and return its timestamp. attachments are (content type, data) pairs.
+
+        A sticker has to be from a pack the account has installed.
+        """
         body: dict = {
             "number": self.number,
             "recipients": [to_rest_group_id(group_id)],
             "message": text,
         }
+        if sticker:
+            body["sticker"] = f"{sticker.pack_id}:{sticker.sticker_id}"
         if attachments:
             body["base64_attachments"] = [
                 f"data:{content_type};base64,{base64.b64encode(data).decode()}"
@@ -242,6 +273,24 @@ class SignalClient:
                 "quote_message": quote_text or "",
             }
         resp = await self._http.post("/v2/send", json=body)
+        resp.raise_for_status()
+        try:
+            timestamp = resp.json()["timestamp"]
+        except (ValueError, KeyError, TypeError):
+            return None
+        return timestamp if isinstance(timestamp, int) else None
+
+    async def attachment(self, attachment_id: str) -> bytes:
+        """A received attachment, which signal-cli downloads as messages arrive."""
+        resp = await self._http.get(f"/v1/attachments/{quote_path(attachment_id, safe='')}")
+        resp.raise_for_status()
+        return resp.content
+
+    async def install_sticker_pack(self, pack_id: str, pack_key: str) -> None:
+        """Install a pack, so the account can send its stickers. signal-cli downloads it first."""
+        resp = await self._http.post(
+            f"/v1/sticker-packs/{self.number}", json={"pack_id": pack_id, "pack_key": pack_key}, timeout=180,
+        )
         resp.raise_for_status()
 
     async def send_direct(self, recipient: str, text: str) -> None:

@@ -16,6 +16,20 @@ CREATE TABLE IF NOT EXISTS settings (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
+-- Images people sent, so /sticker can find the one a reply quotes.
+CREATE TABLE IF NOT EXISTS images (
+    group_id      TEXT    NOT NULL,
+    sender_id     TEXT    NOT NULL,
+    timestamp     INTEGER NOT NULL,
+    attachment_id TEXT    NOT NULL,
+    PRIMARY KEY (group_id, sender_id, timestamp)
+);
+-- The shared sticker pack, in the order the pack shows them.
+CREATE TABLE IF NOT EXISTS stickers (
+    id    INTEGER PRIMARY KEY AUTOINCREMENT,
+    image BLOB    NOT NULL,
+    emoji TEXT    NOT NULL
+);
 """
 
 # Pruning on every insert is wasteful; do it every N inserts instead.
@@ -29,6 +43,13 @@ class ChatMessage:
     sender_name: str
     timestamp: int  # milliseconds since epoch, as sent by Signal
     text: str
+
+
+@dataclass(frozen=True)
+class PackSticker:
+    id: int
+    image: bytes  # a 512x512 WebP
+    emoji: str
 
 
 class MessageStore:
@@ -61,10 +82,42 @@ class MessageStore:
 
     def delete(self, group_id: str, sender_id: str, target_timestamp: int) -> None:
         with self._db:
+            for table in ("messages", "images"):
+                self._db.execute(
+                    f"DELETE FROM {table} WHERE group_id = ? AND sender_id = ? AND timestamp = ?",
+                    (group_id, sender_id, target_timestamp),
+                )
+
+    def add_image(self, group_id: str, sender_id: str, timestamp: int, attachment_id: str) -> None:
+        with self._db:
             self._db.execute(
-                "DELETE FROM messages WHERE group_id = ? AND sender_id = ? AND timestamp = ?",
-                (group_id, sender_id, target_timestamp),
+                "INSERT OR IGNORE INTO images (group_id, sender_id, timestamp, attachment_id) VALUES (?, ?, ?, ?)",
+                (group_id, sender_id, timestamp, attachment_id),
             )
+
+    def image(self, group_id: str, sender_ids: tuple[str, ...], timestamp: int) -> str | None:
+        """The attachment id of an image one of sender_ids sent at timestamp, if it was saved."""
+        placeholders = ", ".join("?" * len(sender_ids))
+        row = self._db.execute(
+            f"SELECT attachment_id FROM images WHERE group_id = ? AND timestamp = ? AND sender_id IN ({placeholders})",
+            (group_id, timestamp, *sender_ids),
+        ).fetchone()
+        return row[0] if row else None
+
+    def stickers(self) -> list[PackSticker]:
+        return [PackSticker(*row) for row in self._db.execute("SELECT id, image, emoji FROM stickers ORDER BY id")]
+
+    def sticker_count(self) -> int:
+        return self._db.execute("SELECT COUNT(*) FROM stickers").fetchone()[0]
+
+    def add_sticker(self, image: bytes, emoji: str) -> int:
+        with self._db:
+            cursor = self._db.execute("INSERT INTO stickers (image, emoji) VALUES (?, ?)", (image, emoji))
+        return cursor.lastrowid or 0
+
+    def remove_sticker(self, sticker_id: int) -> None:
+        with self._db:
+            self._db.execute("DELETE FROM stickers WHERE id = ?", (sticker_id,))
 
     def last_before(
         self, group_id: str, before_timestamp: int, limit: int, after_timestamp: int | None = None
@@ -120,18 +173,19 @@ class MessageStore:
                 )
 
     def prune(self) -> None:
-        """Keep only the newest `history_limit` messages per group."""
+        """Keep only the newest `history_limit` messages, and as many images, per group."""
         with self._db:
-            self._db.execute(
-                """
-                DELETE FROM messages WHERE id IN (
-                    SELECT id FROM (
-                        SELECT id, ROW_NUMBER() OVER (
-                            PARTITION BY group_id ORDER BY timestamp DESC
-                        ) AS rn FROM messages
-                    ) WHERE rn > ?
+            for table in ("messages", "images"):
+                self._db.execute(
+                    f"""
+                    DELETE FROM {table} WHERE rowid IN (
+                        SELECT rowid FROM (
+                            SELECT rowid, ROW_NUMBER() OVER (
+                                PARTITION BY group_id ORDER BY timestamp DESC
+                            ) AS rn FROM {table}
+                        ) WHERE rn > ?
+                    )
+                    """,
+                    (self.history_limit,),
                 )
-                """,
-                (self.history_limit,),
-            )
         self._inserts_since_prune = 0
