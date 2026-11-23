@@ -80,10 +80,10 @@ from tldr_bot.sticker_pack import (
     parse_sticker_command,
 )
 from tldr_bot.stickers import (
-    StickerEmojis,
+    Stickers,
     StickerError,
     build_manifest,
-    decrypt_manifest,
+    decrypt,
     encrypt,
     parse_emojis,
 )
@@ -1022,7 +1022,7 @@ BANDIT_MANIFEST = (Path(__file__).parent / "fixtures" / "bandit-the-cat-manifest
 
 
 def test_decrypt_real_sticker_manifest():
-    emojis = parse_emojis(decrypt_manifest(BANDIT_MANIFEST, bytes.fromhex(BANDIT_PACK_KEY)))
+    emojis = parse_emojis(decrypt(BANDIT_MANIFEST, bytes.fromhex(BANDIT_PACK_KEY)))
     assert emojis[0] == "👍" and emojis[4] == "😴" and emojis[16] == "😸"
 
 
@@ -1030,9 +1030,9 @@ def test_tampered_sticker_manifest_is_rejected():
     tampered = bytearray(BANDIT_MANIFEST)
     tampered[20] ^= 1
     with pytest.raises(StickerError, match="integrity"):
-        decrypt_manifest(bytes(tampered), bytes.fromhex(BANDIT_PACK_KEY))
+        decrypt(bytes(tampered), bytes.fromhex(BANDIT_PACK_KEY))
     with pytest.raises(StickerError):
-        decrypt_manifest(BANDIT_MANIFEST, bytes(32))
+        decrypt(BANDIT_MANIFEST, bytes(32))
 
 
 async def test_sticker_pack_key_from_the_rest_api():
@@ -1069,7 +1069,7 @@ async def test_sticker_emojis_download_each_pack_once(monkeypatch):
         return httpx.Response(200, content=BANDIT_MANIFEST)
 
     keys = FakePackKeys(missing_for=1)  # as if signal-cli was still saving the key
-    lookup = StickerEmojis(keys)
+    lookup = Stickers(keys)
     lookup._cdn._transport = httpx.MockTransport(cdn)
     assert await lookup.emoji(Sticker(BANDIT_PACK_ID, 4)) == "😴"
     assert await lookup.emoji(Sticker(BANDIT_PACK_ID, 16)) == "😸"
@@ -1077,7 +1077,7 @@ async def test_sticker_emojis_download_each_pack_once(monkeypatch):
     assert downloads == [f"/stickers/{BANDIT_PACK_ID}/manifest.proto"]
 
     with pytest.raises(StickerError, match="doesn't know the key"):
-        await StickerEmojis(FakePackKeys(missing_for=2)).emoji(Sticker("0000", 1))
+        await Stickers(FakePackKeys(missing_for=2)).emoji(Sticker("0000", 1))
 
 
 def photo(attachment_id, content_type="image/jpeg", size=None):
@@ -1249,32 +1249,135 @@ async def test_download_attachment_stops_past_the_limit():
 
 
 class FakeStickers:
-    def __init__(self, emoji="😴"):
+    """Stickers whose emoji and picture are given. An exception is raised instead."""
+
+    def __init__(self, emoji="😴", picture=b"PNG"):
         self.result = emoji
+        self.picture_result = picture
+        self.pictures = 0  # how often a picture was fetched
 
     async def emoji(self, sticker):
         if isinstance(self.result, Exception):
             raise self.result
         return self.result
 
+    async def picture(self, sticker):
+        self.pictures += 1
+        if isinstance(self.picture_result, Exception):
+            raise self.picture_result
+        return self.picture_result
 
-async def test_stickers_are_judged_by_their_emoji():
+
+def sticker_data(sticker_id=4, ts=5):
+    return group_data(None, ts=ts, sticker={"packId": BANDIT_PACK_ID, "stickerId": sticker_id})
+
+
+async def test_stickers_are_judged_by_their_emoji_and_picture():
     bot = make_bot()
     bot.stickers = FakeStickers("😴")
     bot.llm.reaction_choice = Choice("🛏️", 0.9)
-    bot.handle(envelope(group_data(None, ts=5, sticker={"packId": BANDIT_PACK_ID, "stickerId": 4})))
+    bot.handle(envelope(sticker_data()))
     await finish_tasks(bot)
-    assert [state for state, _, _ in bot.llm.decisions] == ["😴"]
+    assert bot.llm.described == [[("image/png", b"PNG")]]
+    assert [state for state, _, _ in bot.llm.decisions] == ["😴\n[picture: A black cat.]"]
     assert bot.signal.reactions == [(GROUP, "🛏️", "+420111", 5)]
 
 
-@pytest.mark.parametrize("emoji", [None, StickerError("CDN down")])
-async def test_sticker_without_an_emoji_gets_no_reaction(emoji):
+async def test_each_sticker_is_described_once():
     bot = make_bot()
-    bot.stickers = FakeStickers(emoji)
-    bot.handle(envelope(group_data(None, ts=5, sticker={"packId": BANDIT_PACK_ID, "stickerId": 4})))
+    bot.stickers = FakeStickers("🙂")
+    bot.handle(envelope(sticker_data(4, ts=5)))
+    bot.handle(envelope(sticker_data(4, ts=6)))
+    bot.handle(envelope(sticker_data(5, ts=7)))
     await finish_tasks(bot)
-    assert bot.llm.decisions == [] and bot.signal.reactions == []
+    assert bot.stickers.pictures == 2 and len(bot.llm.described) == 2
+    assert [state for state, _, _ in bot.llm.decisions] == ["🙂\n[picture: A black cat.]"] * 3
+
+
+@pytest.mark.parametrize("emoji, picture, state", [
+    (None, b"PNG", "[picture: A black cat.]"),
+    ("😴", StickerError("Lottie"), "😴"),
+    (StickerError("CDN down"), StickerError("CDN down"), None),
+])
+async def test_sticker_is_judged_by_whatever_can_be_read(emoji, picture, state):
+    bot = make_bot()
+    bot.stickers = FakeStickers(emoji, picture)
+    bot.handle(envelope(sticker_data()))
+    await finish_tasks(bot)
+    assert [s for s, _, _ in bot.llm.decisions] == ([state] if state else [])
+
+
+@pytest.mark.parametrize("retry_after, pictures", [(3600, 1), (0, 2)])
+async def test_failed_sticker_pictures_wait_before_a_retry(monkeypatch, retry_after, pictures):
+    monkeypatch.setattr(bot_module, "STICKER_RETRY_AFTER", retry_after)
+    bot = make_bot()
+    bot.stickers = FakeStickers("🙂", StickerError("CDN down"))
+    bot.handle(envelope(sticker_data(ts=5)))
+    await finish_tasks(bot)
+    bot.handle(envelope(sticker_data(ts=6)))
+    await finish_tasks(bot)
+    assert bot.stickers.pictures == pictures
+    assert [state for state, _, _ in bot.llm.decisions] == ["🙂", "🙂"]
+
+
+async def test_sticker_picture_does_not_need_the_manifest():
+    key = bytes.fromhex(BANDIT_PACK_KEY)
+
+    def cdn(request: httpx.Request):
+        if request.url.path.endswith("manifest.proto"):
+            return httpx.Response(503)
+        return httpx.Response(200, content=encrypt(png(), key))
+
+    lookup = Stickers(FakePackKeys())
+    lookup._cdn._transport = httpx.MockTransport(cdn)
+    assert (await lookup.picture(Sticker(BANDIT_PACK_ID, 4))).startswith(b"\x89PNG")
+    with pytest.raises(StickerError, match="503"):
+        await lookup.emoji(Sticker(BANDIT_PACK_ID, 4))
+
+
+def test_any_unreadable_sticker_picture_is_a_sticker_error(monkeypatch):
+    with pytest.raises(StickerError, match="readable"):
+        stickers_module.first_frame_png(b"{lottie json}")
+
+    def broken_decoder(*args):  # Pillow's decoders fail with IndexError and the like on hostile files
+        raise IndexError("list index out of range")
+
+    monkeypatch.setattr(stickers_module.Image, "open", broken_decoder)
+    with pytest.raises(StickerError, match="IndexError"):
+        stickers_module.first_frame_png(png())
+
+
+def animated_webp():
+    out = io.BytesIO()
+    frames = [Image.new("RGB", (8, 8), color) for color in ("red", "blue")]
+    frames[0].save(out, "WEBP", save_all=True, append_images=frames[1:], lossless=True)
+    return out.getvalue()
+
+
+async def test_sticker_picture_is_decrypted_to_its_first_frame():
+    key = bytes.fromhex(BANDIT_PACK_KEY)
+    files = {
+        f"/stickers/{BANDIT_PACK_ID}/manifest.proto": BANDIT_MANIFEST,
+        f"/stickers/{BANDIT_PACK_ID}/full/4": encrypt(animated_webp(), key),
+        f"/stickers/{BANDIT_PACK_ID}/full/5": encrypt(b"{lottie json}", key),
+        f"/stickers/{BANDIT_PACK_ID}/full/6": encrypt(png(3000, 3000), key),
+        f"/stickers/{BANDIT_PACK_ID}/full/7": b"x" * (stickers_module.MAX_STICKER_DOWNLOAD + 1),
+    }
+    downloads = []
+
+    def cdn(request: httpx.Request):
+        downloads.append(request.url.path)
+        return httpx.Response(200, content=files[request.url.path])
+
+    lookup = Stickers(FakePackKeys())
+    lookup._cdn._transport = httpx.MockTransport(cdn)
+    with Image.open(io.BytesIO(await lookup.picture(Sticker(BANDIT_PACK_ID, 4)))) as image:
+        assert image.format == "PNG" and image.getpixel((0, 0))[:3] == (255, 0, 0)
+    for sticker_id, error in [(5, "readable"), (6, "too big"), (7, "over")]:
+        with pytest.raises(StickerError, match=error):
+            await lookup.picture(Sticker(BANDIT_PACK_ID, sticker_id))
+    assert await lookup.emoji(Sticker(BANDIT_PACK_ID, 4)) == "😴"
+    assert downloads.count(f"/stickers/{BANDIT_PACK_ID}/manifest.proto") == 1
 
 
 async def test_tldr_end_to_end():
@@ -1756,7 +1859,7 @@ def test_parse_image_and_quote():
 def test_built_pack_files_decrypt_and_parse():
     key = bytes(range(32))
     manifest = build_manifest("Title", "Author", ["😺", "🐦"], "image/webp")
-    assert parse_emojis(decrypt_manifest(encrypt(manifest, key), key)) == {0: "😺", 1: "🐦"}
+    assert parse_emojis(decrypt(encrypt(manifest, key), key)) == {0: "😺", 1: "🐦"}
 
 
 def test_make_sticker_fits_any_image_into_512_square():
@@ -1820,9 +1923,9 @@ async def test_upload_puts_every_file_with_its_signed_form(tmp_path):
 
     assert pack.pack_id == pack_id and pack.url.startswith("https://signal.art/addstickers/#pack_id=")
     key = bytes.fromhex(pack.pack_key)
-    manifest = decrypt_manifest(uploads[f"stickers/{pack_id}/manifest.proto"], key)
+    manifest = decrypt(uploads[f"stickers/{pack_id}/manifest.proto"], key)
     assert parse_emojis(manifest) == {0: "😺", 1: "🐦"}
-    assert decrypt_manifest(uploads[f"stickers/{pack_id}/full/1"], key) == b"second"
+    assert decrypt(uploads[f"stickers/{pack_id}/full/1"], key) == b"second"
 
 
 async def test_upload_rate_limit(tmp_path):

@@ -75,7 +75,7 @@ from .sticker_pack import (
     make_sticker,
     parse_sticker_command,
 )
-from .stickers import StickerEmojis, StickerError
+from .stickers import Stickers, StickerError
 from .store import ChatMessage, MessageStore
 
 log = logging.getLogger(__name__)
@@ -110,6 +110,10 @@ MAX_ANNOUNCEMENT_CHARS = 1500
 # one at a time. Past this many waiting, for example during an outage, new messages
 # get no reaction rather than a late one.
 MAX_PENDING_REACTIONS = 20
+# Sticker descriptions kept in memory. Each is a sentence, so this stays small.
+MAX_STICKER_DESCRIPTIONS = 1000
+# A sticker whose picture couldn't be described is judged by its emoji alone for this long.
+STICKER_RETRY_AFTER = 3600.0
 
 # Images the bot sent itself, kept so /sticker works on replies to them. They don't
 # come back as events, so there's no attachment id to fetch them by later.
@@ -326,7 +330,7 @@ class TldrBot:
         llm: LLMClient,
         cats: CatClient,
         cat_gen: CatGenClient | None = None,
-        stickers: StickerEmojis | None = None,  # None means stickers get no reactions
+        stickers: Stickers | None = None,  # None means stickers get no reactions
         github: GitHubClient | None = None,  # None means no /feature and no announcements
         sticker_packs: StickerPackUploader | None = None,  # None means /sticker is disabled
     ):
@@ -349,6 +353,8 @@ class TldrBot:
         self._busy_models: set[str] = set()
         self._reaction_slot = asyncio.Semaphore(1)
         self._pending_reactions = 0
+        # Stickers seen before, oldest first: the description, or None if it failed, and when.
+        self._sticker_descriptions: dict[Sticker, tuple[str | None, float]] = {}
 
     async def run(self) -> None:
         self._spawn(self.announce_updates())
@@ -706,8 +712,9 @@ class TldrBot:
 
     def _queue_reaction(self, msg: GroupMessage) -> None:
         # Other attachments, like files and videos, have nothing to describe or judge.
-        has_pictures = bool(judged_images(msg.attachments))
-        has_text = bool(msg.body) or (msg.sticker is not None and self.stickers is not None)
+        has_sticker = msg.sticker is not None and self.stickers is not None
+        has_pictures = bool(judged_images(msg.attachments)) or has_sticker
+        has_text = bool(msg.body) or has_sticker
         if not has_pictures and not (has_text and self.reaction_rules):
             return
         if self._pending_reactions >= MAX_PENDING_REACTIONS:
@@ -748,7 +755,23 @@ class TldrBot:
             )
 
     async def _picture_description(self, msg: GroupMessage) -> str | None:
-        """What the message's pictures show, or None without pictures or when that fails."""
+        """What the message's pictures or sticker show, or None without any or when that fails."""
+        # The same stickers come up again and again, so each is described once, and one that
+        # failed isn't tried again for a while.
+        if msg.sticker is not None and (cached := self._sticker_descriptions.get(msg.sticker)) is not None:
+            description, at = cached
+            if description is not None or time.monotonic() - at < STICKER_RETRY_AFTER:
+                return description
+        description = await self._describe(msg)
+        if msg.sticker is not None:
+            self._sticker_descriptions.pop(msg.sticker, None)  # re-added as the newest
+            if len(self._sticker_descriptions) >= MAX_STICKER_DESCRIPTIONS:
+                del self._sticker_descriptions[next(iter(self._sticker_descriptions))]
+            self._sticker_descriptions[msg.sticker] = (description, time.monotonic())
+        return description
+
+    async def _describe(self, msg: GroupMessage) -> str | None:
+        """Download and describe the message's pictures or sticker. None when there's nothing or it fails."""
         try:
             async with asyncio.timeout(PICTURE_TIMEOUT):
                 images = await self._download_pictures(msg)
@@ -764,6 +787,14 @@ class TldrBot:
 
     async def _download_pictures(self, msg: GroupMessage) -> list[tuple[str, bytes]]:
         """The pictures to describe, as (content type, data). Failed and oversized ones are left out."""
+        if msg.sticker is not None:
+            if self.stickers is None:
+                return []
+            try:
+                return [("image/png", await self.stickers.picture(msg.sticker))]
+            except StickerError as e:
+                log.warning("Sticker picture failed: %s", e)
+                return []
         images: list[tuple[str, bytes]] = []
         for attachment in judged_images(msg.attachments):
             try:

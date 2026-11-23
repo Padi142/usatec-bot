@@ -1,19 +1,22 @@
-"""Signal sticker packs: their encryption and manifest format, and the emojis of stickers.
+"""Signal sticker packs: their encryption and manifest format, and the emoji and picture of stickers.
 
 signal-cli knows which emoji each sticker stands for, but its JSON output and the
 REST API leave it out. The API does list every pack the account has seen, with
-the pack key, so the bot fetches and decrypts the manifest itself.
+the pack key, so the bot fetches and decrypts the manifest, and the sticker's
+picture when it gets described, itself.
 """
 
 import asyncio
 import hashlib
 import hmac
+import io
 import logging
 import os
 import ssl
 from collections.abc import Iterator
 
 import httpx
+from PIL import Image
 from cryptography.hazmat.primitives import padding
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
@@ -60,6 +63,10 @@ Lrsybb0z5gg8w7ZblEuB9zOW9M3l60DXuJO6l7g+deV6P96rv2unHS8UlvWiVWDy
 9qfgAJizyy3kqM4lOwBH
 -----END CERTIFICATE-----
 """
+# Signal allows 300 KiB per sticker; manifests are far smaller. More than this isn't a sticker.
+MAX_STICKER_DOWNLOAD = 1_000_000
+# Stickers are 512x512. This bounds the memory a hostile pack's picture can take to decode.
+MAX_STICKER_PIXELS = 4_000_000
 # signal-cli may still be saving the pack key when the message event arrives.
 PACK_KEY_RETRY_DELAY = 2.0
 
@@ -97,19 +104,37 @@ def encrypt(data: bytes, pack_key: bytes) -> bytes:
     return body + hmac.new(mac_key, body, hashlib.sha256).digest()
 
 
-def decrypt_manifest(data: bytes, pack_key: bytes) -> bytes:
-    """Decrypt a manifest.proto: AES-256-CBC with a trailing HMAC-SHA256 over the IV and ciphertext."""
+def decrypt(data: bytes, pack_key: bytes) -> bytes:
+    """Decrypt a manifest.proto or a sticker: AES-256-CBC with a trailing HMAC-SHA256 over the IV and ciphertext."""
     aes_key, mac_key = _pack_keys(pack_key)
     body, mac = data[:-_MAC_SIZE], data[-_MAC_SIZE:]
     if len(body) <= _IV_SIZE or not hmac.compare_digest(hmac.new(mac_key, body, hashlib.sha256).digest(), mac):
-        raise StickerError("Sticker manifest failed its integrity check")
+        raise StickerError("Sticker data failed its integrity check")
     decryptor = Cipher(algorithms.AES(aes_key), modes.CBC(body[:_IV_SIZE])).decryptor()
     unpadder = padding.PKCS7(128).unpadder()
     try:
         padded = decryptor.update(body[_IV_SIZE:]) + decryptor.finalize()
         return unpadder.update(padded) + unpadder.finalize()
     except ValueError as e:
-        raise StickerError(f"Sticker manifest is malformed: {e}") from e
+        raise StickerError(f"Sticker data is malformed: {e}") from e
+
+
+def first_frame_png(data: bytes) -> bytes:
+    """A sticker's picture as a PNG, so a vision model can read it. Animated ones give their first frame.
+
+    Raises StickerError for what Pillow can't read, like Lottie animations.
+    """
+    try:
+        with Image.open(io.BytesIO(data)) as image:
+            if image.width * image.height > MAX_STICKER_PIXELS:
+                raise StickerError(f"Sticker is {image.width}x{image.height}, too big to describe")
+            out = io.BytesIO()
+            image.convert("RGBA").save(out, "PNG")  # converting reads the first frame only
+            return out.getvalue()
+    except StickerError:
+        raise
+    except Exception as e:  # Pillow's decoders fail in many ways on hostile files, like IndexError
+        raise StickerError(f"Sticker isn't a readable picture: {type(e).__name__}: {e}") from e
 
 
 def _varint(data: bytes, pos: int) -> tuple[int, int]:
@@ -193,39 +218,65 @@ def build_manifest(title: str, author: str, emojis: list[str], content_type: str
     return pack
 
 
-class StickerEmojis:
-    """Looks up the emoji of a sticker. Each pack is downloaded once, then kept in memory."""
+class Stickers:
+    """Reads the stickers people send: their emoji and their picture.
+
+    Each pack's key and emojis are fetched once, then kept in memory.
+    """
 
     def __init__(self, signal: SignalClient):
         self._signal = signal
         self._cdn = httpx.AsyncClient(
             base_url=SIGNAL_CDN, verify=ssl.create_default_context(cadata=SIGNAL_CA), timeout=15,
         )
-        self._packs: dict[str, dict[int, str]] = {}
+        self._keys: dict[str, bytes] = {}
+        self._emojis: dict[str, dict[int, str]] = {}  # pack id to sticker id to emoji
 
     async def close(self) -> None:
         await self._cdn.aclose()
 
     async def emoji(self, sticker: Sticker) -> str | None:
         """The sticker's emoji, or None if its pack doesn't name one. Raises StickerError."""
-        if sticker.pack_id not in self._packs:
-            self._packs[sticker.pack_id] = await self._load_pack(sticker.pack_id)
-        return self._packs[sticker.pack_id].get(sticker.sticker_id)
+        if sticker.pack_id not in self._emojis:
+            key = await self._key(sticker.pack_id)
+            manifest = await self._download(f"/stickers/{sticker.pack_id}/manifest.proto", MAX_STICKER_DOWNLOAD)
+            self._emojis[sticker.pack_id] = parse_emojis(decrypt(manifest, key))
+        return self._emojis[sticker.pack_id].get(sticker.sticker_id)
 
-    async def _load_pack(self, pack_id: str) -> dict[int, str]:
+    async def picture(self, sticker: Sticker) -> bytes:
+        """The sticker's picture as a PNG. Raises StickerError."""
+        key = await self._key(sticker.pack_id)
+        data = await self._download(f"/stickers/{sticker.pack_id}/full/{sticker.sticker_id}", MAX_STICKER_DOWNLOAD)
+        return first_frame_png(decrypt(data, key))
+
+    async def _key(self, pack_id: str) -> bytes:
+        if pack_id in self._keys:
+            return self._keys[pack_id]
         try:
             pack_key = await self._signal.sticker_pack_key(pack_id)
             if pack_key is None:
                 await asyncio.sleep(PACK_KEY_RETRY_DELAY)
                 pack_key = await self._signal.sticker_pack_key(pack_id)
-            if pack_key is None:
-                raise StickerError(f"Signal doesn't know the key of sticker pack {pack_id}")
-            resp = await self._cdn.get(f"/stickers/{pack_id}/manifest.proto")
-            resp.raise_for_status()
         except httpx.HTTPError as e:
-            raise StickerError(f"Sticker pack {pack_id} download failed: {e}") from e
+            raise StickerError(f"Sticker pack {pack_id} key lookup failed: {e}") from e
+        if pack_key is None:
+            raise StickerError(f"Signal doesn't know the key of sticker pack {pack_id}")
         try:
-            key = bytes.fromhex(pack_key)
+            self._keys[pack_id] = bytes.fromhex(pack_key)
         except ValueError as e:
             raise StickerError(f"Sticker pack {pack_id} has an invalid key") from e
-        return parse_emojis(decrypt_manifest(resp.content, key))
+        return self._keys[pack_id]
+
+    async def _download(self, path: str, max_bytes: int) -> bytes:
+        """A file from Signal's CDN, read no further than max_bytes. Raises StickerError."""
+        try:
+            async with self._cdn.stream("GET", path) as resp:
+                resp.raise_for_status()
+                data = bytearray()
+                async for chunk in resp.aiter_bytes():
+                    data += chunk
+                    if len(data) > max_bytes:
+                        raise StickerError(f"{path} is over {max_bytes} bytes")
+                return bytes(data)
+        except httpx.HTTPError as e:
+            raise StickerError(f"{path} download failed: {e}") from e
