@@ -1,5 +1,6 @@
+import json
 import sqlite3
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS messages (
@@ -16,6 +17,20 @@ CREATE TABLE IF NOT EXISTS settings (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
+-- Images people sent, so /sticker can find the one a reply quotes.
+CREATE TABLE IF NOT EXISTS images (
+    group_id      TEXT    NOT NULL,
+    sender_id     TEXT    NOT NULL,
+    timestamp     INTEGER NOT NULL,
+    attachment_id TEXT    NOT NULL,
+    PRIMARY KEY (group_id, sender_id, timestamp)
+);
+-- The shared sticker pack, in the order the pack shows them.
+CREATE TABLE IF NOT EXISTS stickers (
+    id    INTEGER PRIMARY KEY AUTOINCREMENT,
+    image BLOB    NOT NULL,
+    emoji TEXT    NOT NULL
+);
 """
 
 # Pruning on every insert is wasteful; do it every N inserts instead.
@@ -29,6 +44,28 @@ class ChatMessage:
     sender_name: str
     timestamp: int  # milliseconds since epoch, as sent by Signal
     text: str
+
+
+# Settings key for the current version of the shared sticker pack, as JSON.
+STICKER_PACK_SETTING = "sticker_pack"
+
+
+@dataclass(frozen=True)
+class PackSticker:
+    id: int
+    image: bytes  # a 512x512 WebP
+    emoji: str
+
+
+@dataclass(frozen=True)
+class PackRef:
+    """One uploaded version of the sticker pack."""
+    pack_id: str  # hex
+    pack_key: str  # hex
+
+    @property
+    def url(self) -> str:
+        return f"https://signal.art/addstickers/#pack_id={self.pack_id}&pack_key={self.pack_key}"
 
 
 class MessageStore:
@@ -61,9 +98,59 @@ class MessageStore:
 
     def delete(self, group_id: str, sender_id: str, target_timestamp: int) -> None:
         with self._db:
+            for table in ("messages", "images"):
+                self._db.execute(
+                    f"DELETE FROM {table} WHERE group_id = ? AND sender_id = ? AND timestamp = ?",
+                    (group_id, sender_id, target_timestamp),
+                )
+
+    def add_image(self, group_id: str, sender_id: str, timestamp: int, attachment_id: str) -> None:
+        with self._db:
             self._db.execute(
-                "DELETE FROM messages WHERE group_id = ? AND sender_id = ? AND timestamp = ?",
-                (group_id, sender_id, target_timestamp),
+                "INSERT OR IGNORE INTO images (group_id, sender_id, timestamp, attachment_id) VALUES (?, ?, ?, ?)",
+                (group_id, sender_id, timestamp, attachment_id),
+            )
+
+    def image(self, group_id: str, sender_ids: tuple[str, ...], timestamp: int) -> str | None:
+        """The attachment id of an image one of sender_ids sent at timestamp, if it was saved."""
+        placeholders = ", ".join("?" * len(sender_ids))
+        row = self._db.execute(
+            f"SELECT attachment_id FROM images WHERE group_id = ? AND timestamp = ? AND sender_id IN ({placeholders})",
+            (group_id, timestamp, *sender_ids),
+        ).fetchone()
+        return row[0] if row else None
+
+    def stickers(self) -> list[PackSticker]:
+        return [PackSticker(*row) for row in self._db.execute("SELECT id, image, emoji FROM stickers ORDER BY id")]
+
+    def sticker_count(self) -> int:
+        return self._db.execute("SELECT COUNT(*) FROM stickers").fetchone()[0]
+
+    def sticker_pack(self) -> PackRef | None:
+        """The current version of the shared sticker pack, None while it's empty."""
+        raw = self.setting(STICKER_PACK_SETTING)
+        return PackRef(**json.loads(raw)) if raw else None
+
+    # Edits take the pack version that was uploaded with them, so the stored stickers
+    # and the published pack change together or not at all.
+
+    def add_sticker(self, image: bytes, emoji: str, pack: PackRef) -> None:
+        with self._db:
+            self._db.execute("INSERT INTO stickers (image, emoji) VALUES (?, ?)", (image, emoji))
+            self._set_pack(pack)
+
+    def remove_sticker(self, sticker_id: int, pack: PackRef | None) -> None:
+        with self._db:
+            self._db.execute("DELETE FROM stickers WHERE id = ?", (sticker_id,))
+            self._set_pack(pack)
+
+    def _set_pack(self, pack: PackRef | None) -> None:
+        if pack is None:
+            self._db.execute("DELETE FROM settings WHERE key = ?", (STICKER_PACK_SETTING,))
+        else:
+            self._db.execute(
+                "INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+                (STICKER_PACK_SETTING, json.dumps(asdict(pack))),
             )
 
     def last_before(
@@ -120,18 +207,19 @@ class MessageStore:
                 )
 
     def prune(self) -> None:
-        """Keep only the newest `history_limit` messages per group."""
+        """Keep only the newest `history_limit` messages, and as many images, per group."""
         with self._db:
-            self._db.execute(
-                """
-                DELETE FROM messages WHERE id IN (
-                    SELECT id FROM (
-                        SELECT id, ROW_NUMBER() OVER (
-                            PARTITION BY group_id ORDER BY timestamp DESC
-                        ) AS rn FROM messages
-                    ) WHERE rn > ?
+            for table in ("messages", "images"):
+                self._db.execute(
+                    f"""
+                    DELETE FROM {table} WHERE rowid IN (
+                        SELECT rowid FROM (
+                            SELECT rowid, ROW_NUMBER() OVER (
+                                PARTITION BY group_id ORDER BY timestamp DESC
+                            ) AS rn FROM {table}
+                        ) WHERE rn > ?
+                    )
+                    """,
+                    (self.history_limit,),
                 )
-                """,
-                (self.history_limit,),
-            )
         self._inserts_since_prune = 0

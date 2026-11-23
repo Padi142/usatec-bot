@@ -1,4 +1,4 @@
-"""Emojis of Signal stickers, read from the sticker pack manifests on Signal's CDN.
+"""Signal sticker packs: their encryption and manifest format, and the emojis of stickers.
 
 signal-cli knows which emoji each sticker stands for, but its JSON output and the
 REST API leave it out. The API does list every pack the account has seen, with
@@ -9,6 +9,7 @@ import asyncio
 import hashlib
 import hmac
 import logging
+import os
 import ssl
 from collections.abc import Iterator
 
@@ -80,10 +81,25 @@ def _hkdf(key: bytes, info: bytes, length: int) -> bytes:
     return output[:length]
 
 
+def _pack_keys(pack_key: bytes) -> tuple[bytes, bytes]:
+    """The AES and HMAC keys that encrypt everything in a pack: its manifest and each sticker."""
+    keys = _hkdf(pack_key, b"Sticker Pack", 64)
+    return keys[:32], keys[32:]
+
+
+def encrypt(data: bytes, pack_key: bytes) -> bytes:
+    """Encrypt a manifest or sticker for the CDN: IV, AES-256-CBC ciphertext, then HMAC-SHA256 of both."""
+    aes_key, mac_key = _pack_keys(pack_key)
+    iv = os.urandom(_IV_SIZE)
+    padder = padding.PKCS7(128).padder()
+    encryptor = Cipher(algorithms.AES(aes_key), modes.CBC(iv)).encryptor()
+    body = iv + encryptor.update(padder.update(data) + padder.finalize()) + encryptor.finalize()
+    return body + hmac.new(mac_key, body, hashlib.sha256).digest()
+
+
 def decrypt_manifest(data: bytes, pack_key: bytes) -> bytes:
     """Decrypt a manifest.proto: AES-256-CBC with a trailing HMAC-SHA256 over the IV and ciphertext."""
-    keys = _hkdf(pack_key, b"Sticker Pack", 64)
-    aes_key, mac_key = keys[:32], keys[32:]
+    aes_key, mac_key = _pack_keys(pack_key)
     body, mac = data[:-_MAC_SIZE], data[-_MAC_SIZE:]
     if len(body) <= _IV_SIZE or not hmac.compare_digest(hmac.new(mac_key, body, hashlib.sha256).digest(), mac):
         raise StickerError("Sticker manifest failed its integrity check")
@@ -146,6 +162,35 @@ def parse_emojis(manifest: bytes) -> dict[int, str]:
     except (IndexError, UnicodeDecodeError) as e:
         raise StickerError(f"Sticker manifest is malformed: {e}") from e
     return emojis
+
+
+def _encode_varint(value: int) -> bytes:
+    out = bytearray()
+    while value >= 0x80:
+        out.append(value & 0x7F | 0x80)
+        value >>= 7
+    out.append(value)
+    return bytes(out)
+
+
+def _encode_field(number: int, value: int | bytes) -> bytes:
+    if isinstance(value, int):
+        return _encode_varint(number << 3) + _encode_varint(value)
+    return _encode_varint(number << 3 | 2) + _encode_varint(len(value)) + value
+
+
+def _encode_sticker(sticker_id: int, emoji: str, content_type: str | None = None) -> bytes:
+    fields = _encode_field(1, sticker_id) + _encode_field(2, emoji.encode())
+    return fields + (_encode_field(3, content_type.encode()) if content_type else b"")
+
+
+def build_manifest(title: str, author: str, emojis: list[str], content_type: str) -> bytes:
+    """A manifest.proto for stickers 0..n-1 with these emojis. The first sticker is the cover."""
+    pack = _encode_field(1, title.encode()) + _encode_field(2, author.encode())
+    pack += _encode_field(3, _encode_sticker(0, ""))
+    for sticker_id, emoji in enumerate(emojis):
+        pack += _encode_field(4, _encode_sticker(sticker_id, emoji, content_type))
+    return pack
 
 
 class StickerEmojis:

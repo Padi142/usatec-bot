@@ -78,6 +78,9 @@ class Config:
     # /feature files GitHub issues here. Without a token, /feature is disabled.
     github_token: str | None = None
     github_repo: str = "Padi142/usatec-bot"
+    # signal-cli's data directory, for the account credentials /sticker uploads packs with.
+    # Without it, /sticker is disabled.
+    signal_cli_dir: str | None = None
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -102,4 +105,5 @@ class Config:
             vision_model=os.environ.get("VISION_MODEL") or cls.vision_model,
             github_token=os.environ.get("GITHUB_TOKEN") or None,
             github_repo=os.environ.get("GITHUB_REPO") or cls.github_repo,
+            signal_cli_dir=os.environ.get("SIGNAL_CLI_DIR") or None,
         )

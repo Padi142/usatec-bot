@@ -35,10 +35,13 @@ services:
       - CAT_GEN_API_KEY=${CAT_GEN_API_KEY:-}
       - GITHUB_TOKEN=${GITHUB_TOKEN:-}
       - GITHUB_REPO=${GITHUB_REPO:-}
+      - SIGNAL_CLI_DIR=/signal-cli
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
       - TZ=${TZ:-Europe/Prague}
     volumes:
       - bot-data:/data
+      # Read-only, for the account credentials /sticker uploads sticker packs with.
+      - signal-cli-data:/signal-cli:ro
     # Healthy while the bot is connected to the Signal API; see tldr_bot/health.py.
     healthcheck:
       test: ["CMD", "/app/.venv/bin/python", "-m", "tldr_bot.health"]

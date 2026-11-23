@@ -68,6 +68,16 @@ so the request and the sender's display name are public too. Phone numbers are m
 GitHub mentions don't notify anyone. Each person can send one request every 5 minutes.
 It needs `GITHUB_TOKEN`: a fine-grained token with only **Issues: read and write** on this repo,
 from an account with write access to it, or GitHub drops the label.
+`/sticker` as a reply to an image adds it to the sticker pack all groups share, and the bot
+replies with the new sticker. Tap it to install the pack. `/sticker 😺` gives the sticker an emoji,
+and an image sent with `/sticker` as its caption works too. `/sticker remove 3` removes the third
+sticker, and `/sticker` on its own shows the pack's link.
+
+Signal sticker packs can't change, so each edit uploads the whole pack again as a new pack, and
+it has to be installed again to get the new stickers. Signal allows about 20 uploads a day. The
+REST API can't upload packs, so the bot does it itself, with the account credentials it reads
+from signal-cli's data volume. It only knows images sent while it was running, and the ones it
+sent itself since its last restart.
 
 ## How it works
 

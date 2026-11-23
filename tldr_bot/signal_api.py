@@ -38,6 +38,13 @@ class Attachment:
 
 
 @dataclass(frozen=True)
+class Quote:
+    """The message a reply quotes. Authors show up by UUID, number or both."""
+    timestamp: int
+    author_ids: tuple[str, ...]
+
+
+@dataclass(frozen=True)
 class GroupMessage:
     group_id: str
     sender_id: str
@@ -50,6 +57,12 @@ class GroupMessage:
     body: str | None = None
     sticker: Sticker | None = None
     attachments: tuple[Attachment, ...] = ()
+    quote: Quote | None = None
+
+    @property
+    def image(self) -> Attachment | None:
+        """The first picture, which /sticker turns into a sticker."""
+        return next((a for a in self.attachments if a.content_type.startswith("image/")), None)
 
 
 @dataclass(frozen=True)
@@ -120,6 +133,14 @@ def _attachments(data: dict) -> tuple[Attachment, ...]:
     )
 
 
+def _quote(data: dict) -> Quote | None:
+    quote = data.get("quote") or {}
+    authors = tuple(a for a in (quote.get("authorUuid"), quote.get("authorNumber")) if isinstance(a, str) and a)
+    if isinstance(quote.get("id"), int) and authors:
+        return Quote(quote["id"], authors)
+    return None
+
+
 def _mentions(data: dict) -> list[Mention]:
     return [
         Mention(
@@ -183,7 +204,7 @@ def parse_event(payload: dict) -> Event | None:
     timestamp = data.get("timestamp") or env.get("timestamp")
     return GroupMessage(
         group_id, sender_id, sender_name, sender_number, timestamp, text, _mentions(data), data.get("message"),
-        _sticker(data), _attachments(data),
+        _sticker(data), _attachments(data), _quote(data),
     )
 
 
@@ -239,13 +260,19 @@ class SignalClient:
         quote_author: str | None = None,
         quote_text: str | None = None,
         attachments: list[tuple[str, bytes]] | None = None,
-    ) -> None:
-        """Send a group message. attachments are (content type, data) pairs."""
+        sticker: Sticker | None = None,
+    ) -> int | None:
+        """Send a group message and return its timestamp. attachments are (content type, data) pairs.
+
+        A sticker has to be from a pack the account has installed.
+        """
         body: dict = {
             "number": self.number,
             "recipients": [to_rest_group_id(group_id)],
             "message": text,
         }
+        if sticker:
+            body["sticker"] = f"{sticker.pack_id}:{sticker.sticker_id}"
         if attachments:
             body["base64_attachments"] = [
                 f"data:{content_type};base64,{base64.b64encode(data).decode()}"
@@ -258,6 +285,18 @@ class SignalClient:
                 "quote_message": quote_text or "",
             }
         resp = await self._http.post("/v2/send", json=body)
+        resp.raise_for_status()
+        # The REST API sends the timestamp as a decimal string.
+        try:
+            return int(resp.json()["timestamp"])
+        except (ValueError, KeyError, TypeError):
+            return None
+
+    async def install_sticker_pack(self, pack_id: str, pack_key: str) -> None:
+        """Install a pack, so the account can send its stickers. signal-cli downloads it first."""
+        resp = await self._http.post(
+            f"/v1/sticker-packs/{self.number}", json={"pack_id": pack_id, "pack_key": pack_key}, timeout=180,
+        )
         resp.raise_for_status()
 
     async def send_direct(self, recipient: str, text: str) -> None:
