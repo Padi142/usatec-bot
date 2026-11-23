@@ -14,10 +14,13 @@ from .config import Config
 from .features import (
     COOLDOWN_SECONDS,
     FEATURE_LABEL,
+    MAX_ANNOUNCED_COMMITS,
     MAX_REQUEST_CHARS,
+    Commit,
     FeatureCommand,
     GitHubError,
     GitHubIssues,
+    format_commit_messages,
     issue_body,
     issue_title,
     parse_feature_command,
@@ -89,6 +92,10 @@ TIME_RE = re.compile(r"^(\d{1,2}):(\d{2})$")
 # Settings key for the model chosen with /model.
 MODEL_SETTING = "llm_model"
 REACTION_RULES_SETTING = "reaction_rules"
+ANNOUNCED_COMMIT_SETTING = "announced_commit"
+
+# Startup deploy announcement budget, so a slow API never hangs the background task.
+ANNOUNCE_TIMEOUT = 60.0
 
 # The API key allows 4 parallel requests and summaries need them, so reactions run
 # one at a time. Past this many waiting, for example during an outage, new messages
@@ -328,11 +335,79 @@ class TldrBot:
         self._pending_reactions = 0
 
     async def run(self) -> None:
+        if self.cfg.announce_updates and self.issues is not None:
+            self._spawn(self._announce_on_startup())
         async for payload in self.signal.events():
             try:
                 self.handle(payload)
             except Exception:
                 log.exception("Failed to handle payload: %.500s", payload)
+
+    async def _announce_on_startup(self) -> None:
+        while not getattr(self.signal, "connected", True):
+            await asyncio.sleep(0.1)
+        await self.announce_updates()
+
+    async def announce_updates(self) -> None:
+        """Announce commits deployed since the last run. Never raises or blocks startup."""
+        try:
+            async with asyncio.timeout(ANNOUNCE_TIMEOUT):
+                await self._announce_updates()
+        except Exception:
+            log.exception("Deploy announcement failed")
+
+    async def _announce_updates(self) -> None:
+        if not self.cfg.announce_updates or self.issues is None:
+            return
+        if not self.cfg.allowed_groups:
+            log.info("Skipping deploy announcement: ALLOWED_GROUPS is empty")
+            return
+        commits = await self.issues.recent_commits("master", per_page=MAX_ANNOUNCED_COMMITS + 1)
+        if not commits:
+            return
+        head = commits[0].sha
+        stored = self.store.setting(ANNOUNCED_COMMIT_SETTING)
+        if stored is None:
+            self.store.set_setting(ANNOUNCED_COMMIT_SETTING, head)
+            return
+        if stored == head:
+            return
+
+        newer: list[Commit] = []
+        found = False
+        for commit in commits:
+            if commit.sha == stored:
+                found = True
+                break
+            newer.append(commit)
+        incomplete = not found or len(newer) > MAX_ANNOUNCED_COMMITS
+        newer = newer[:MAX_ANNOUNCED_COMMITS]
+        if not newer:
+            return
+
+        try:
+            summary = await self.llm.summarize_commits(format_commit_messages(newer), self.current_model)
+        except LLMError as e:
+            log.warning("Deploy summary failed, falling back to commit titles: %s", e)
+            summary = "\n".join(f"- {c.title}" for c in newer)
+
+        header = (
+            f"What's new (newest {len(newer)} commits, list may be incomplete):"
+            if incomplete
+            else "What's new:"
+        )
+        text = f"{header}\n\n{summary}"
+
+        # allowed_groups holds internal group ids, which send_group converts with to_rest_group_id.
+        sent = 0
+        for group_id in sorted(self.cfg.allowed_groups):
+            try:
+                await self.signal.send_group(group_id, text)
+                sent += 1
+            except (httpx.HTTPError, OSError) as e:
+                log.error("Failed to send deploy announcement to group %s: %s", group_id, e)
+        if sent:
+            self.store.set_setting(ANNOUNCED_COMMIT_SETTING, head)
 
     def handle(self, payload: dict) -> None:
         event = parse_event(payload)
@@ -480,7 +555,7 @@ class TldrBot:
 
     async def _file_feature(self, msg: GroupMessage, command: FeatureCommand) -> str:
         """File the request as a GitHub issue and return what to tell the sender."""
-        if self.issues is None:
+        if self.issues is None or getattr(self.issues, "token", "") is None:
             return "Feature requests aren't set up (GITHUB_TOKEN is missing)."
         if command.request is None:
             return "Usage: /feature <what the bot should do>\nI'll save it for the next build session."

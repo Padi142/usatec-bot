@@ -68,6 +68,11 @@ so the request and the sender's display name are public too. Phone numbers are m
 GitHub mentions don't notify anyone. Each person can send one request every 5 minutes.
 It needs `GITHUB_TOKEN`: a fine-grained token with only **Issues: read and write** on this repo,
 from an account with write access to it, or GitHub drops the label.
+
+After a deploy with new commits on `master`, the bot posts a short "What's new" summary to the
+groups in `ALLOWED_GROUPS` (falling back to the commit titles if the LLM is unavailable). When
+`ALLOWED_GROUPS` is empty it announces nothing, so a linked personal account never broadcasts to
+every group it's in. Set `ANNOUNCE_UPDATES=false` to turn these announcements off.
 `/sticker` as a reply to an image adds it to the sticker pack all groups share, and the bot
 replies with the new sticker. Tap it to install the pack. `/sticker 😺` gives the sticker an emoji,
 and an image sent with `/sticker` as its caption works too. `/sticker remove 3` removes the third

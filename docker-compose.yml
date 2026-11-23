@@ -35,6 +35,7 @@ services:
       - CAT_GEN_API_KEY=${CAT_GEN_API_KEY:-}
       - GITHUB_TOKEN=${GITHUB_TOKEN:-}
       - GITHUB_REPO=${GITHUB_REPO:-}
+      - ANNOUNCE_UPDATES=${ANNOUNCE_UPDATES:-}
       - SIGNAL_CLI_DIR=/signal-cli
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
       - TZ=${TZ:-Europe/Prague}

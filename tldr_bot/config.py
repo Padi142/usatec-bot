@@ -21,6 +21,17 @@ def _float(name: str, default: float) -> float:
     return float(raw) if raw else default
 
 
+def _bool(name: str, default: bool) -> bool:
+    raw = os.environ.get(name, "").strip().lower()
+    if not raw:
+        return default
+    if raw in {"1", "true", "yes", "on"}:
+        return True
+    if raw in {"0", "false", "no", "off"}:
+        return False
+    raise SystemExit(f"{name} must be true or false, got {raw!r}")
+
+
 @dataclass(frozen=True)
 class DiscordConfig:
     token: str
@@ -78,6 +89,8 @@ class Config:
     # /feature files GitHub issues here. Without a token, /feature is disabled.
     github_token: str | None = None
     github_repo: str = "Padi142/usatec-bot"
+    # Post a "What's new" summary to allowed_groups when startup sees new commits on master.
+    announce_updates: bool = True
     # signal-cli's data directory, for the account credentials /sticker uploads packs with.
     # Without it, /sticker is disabled.
     signal_cli_dir: str | None = None
@@ -105,5 +118,6 @@ class Config:
             vision_model=os.environ.get("VISION_MODEL") or cls.vision_model,
             github_token=os.environ.get("GITHUB_TOKEN") or None,
             github_repo=os.environ.get("GITHUB_REPO") or cls.github_repo,
+            announce_updates=_bool("ANNOUNCE_UPDATES", cls.announce_updates),
             signal_cli_dir=os.environ.get("SIGNAL_CLI_DIR") or None,
         )
