@@ -5,6 +5,7 @@ import os
 from .bot import TldrBot
 from .cats import CatClient, CatGenClient
 from .config import Config
+from .features import GitHubIssues
 from .health import heartbeat
 from .llm import LLMClient
 from .signal_api import SignalClient
@@ -20,9 +21,10 @@ async def main() -> None:
     cats = CatClient()
     cat_gen = CatGenClient(cfg.cat_gen_api_key) if cfg.cat_gen_api_key else None
     stickers = StickerEmojis(signal)
+    issues = GitHubIssues(cfg.github_token, cfg.github_repo) if cfg.github_token else None
     health = asyncio.create_task(heartbeat(signal))
     try:
-        await TldrBot(cfg, store, signal, llm, cats, cat_gen, stickers).run()
+        await TldrBot(cfg, store, signal, llm, cats, cat_gen, stickers, issues).run()
     finally:
         health.cancel()
         await signal.close()
@@ -31,6 +33,8 @@ async def main() -> None:
         await stickers.close()
         if cat_gen:
             await cat_gen.close()
+        if issues:
+            await issues.close()
         store.close()
 
 

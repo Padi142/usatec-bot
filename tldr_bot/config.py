@@ -73,6 +73,9 @@ class Config:
     cat_gen_api_key: str | None = None
     # Judges every group message. This has to be a decision model, not a chat model.
     reaction_model: str = "vllm-sr-d3-flash"
+    # /feature files GitHub issues here. Without a token, /feature is disabled.
+    github_token: str | None = None
+    github_repo: str = "Padi142/usatec-bot"
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -94,4 +97,6 @@ class Config:
             ),
             cat_gen_api_key=os.environ.get("CAT_GEN_API_KEY") or None,
             reaction_model=os.environ.get("REACTION_MODEL") or cls.reaction_model,
+            github_token=os.environ.get("GITHUB_TOKEN") or None,
+            github_repo=os.environ.get("GITHUB_REPO") or cls.github_repo,
         )

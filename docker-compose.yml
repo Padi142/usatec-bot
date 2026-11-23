@@ -32,6 +32,8 @@ services:
       - HISTORY_LIMIT=${HISTORY_LIMIT:-}
       - ALLOWED_GROUPS=${ALLOWED_GROUPS:-}
       - CAT_GEN_API_KEY=${CAT_GEN_API_KEY:-}
+      - GITHUB_TOKEN=${GITHUB_TOKEN:-}
+      - GITHUB_REPO=${GITHUB_REPO:-}
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
       - TZ=${TZ:-Europe/Prague}
     volumes:

@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import re
+import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
@@ -8,6 +9,17 @@ from zoneinfo import ZoneInfo
 
 from .cats import GRID_LAYOUTS, CatClient, CatError, CatGenClient
 from .config import Config
+from .features import (
+    COOLDOWN_SECONDS,
+    FEATURE_LABEL,
+    MAX_REQUEST_CHARS,
+    FeatureCommand,
+    GitHubError,
+    GitHubIssues,
+    issue_body,
+    issue_title,
+    parse_feature_command,
+)
 from .llm import LLMClient, LLMError, ModelInfo
 from .reactions import (
     INSTRUCTIONS,
@@ -260,6 +272,7 @@ class TldrBot:
         cats: CatClient,
         cat_gen: CatGenClient | None = None,
         stickers: StickerEmojis | None = None,  # None means stickers get no reactions
+        issues: GitHubIssues | None = None,  # None means /feature is disabled
     ):
         self.cfg = cfg
         self.store = store
@@ -268,6 +281,8 @@ class TldrBot:
         self.cats = cats
         self.cat_gen = cat_gen
         self.stickers = stickers
+        self.issues = issues
+        self._last_feature: dict[str, float] = {}  # sender id -> monotonic time of their last /feature
         self._tasks: set[asyncio.Task] = set()
         # Models with a summary running. Each runs one at a time, across all groups.
         self._busy_models: set[str] = set()
@@ -313,6 +328,11 @@ class TldrBot:
             )) is not None:
                 log.info("/prompt from %s in group %s", event.sender_name, event.group_id)
                 self._spawn(self.run_prompt(event, prompt_command))
+            case GroupMessage() if (feature_command := parse_feature_command(
+                render_mentions(event.body or "", event.mentions, self.store.display_name)
+            )) is not None:
+                log.info("/feature from %s in group %s", event.sender_name, event.group_id)
+                self._spawn(self.run_feature(event, feature_command))
             case GroupMessage() if (react_command := parse_react_command(event.text)) is not None:
                 log.info("/react from %s in group %s", event.sender_name, event.group_id)
                 self._spawn(self.run_react_command(event, react_command))
@@ -396,6 +416,42 @@ class TldrBot:
             await self.reply(msg, "🐈", attachments=[cat])
         except Exception:
             log.exception("/mackagen failed")
+
+    async def run_feature(self, msg: GroupMessage, command: FeatureCommand) -> None:
+        try:
+            await self.reply(msg, await self._file_feature(msg, command))
+        except Exception:
+            log.exception("/feature failed")
+
+    async def _file_feature(self, msg: GroupMessage, command: FeatureCommand) -> str:
+        """File the request as a GitHub issue and return what to tell the sender."""
+        if self.issues is None:
+            return "Feature requests aren't set up (GITHUB_TOKEN is missing)."
+        if command.request is None:
+            return "Usage: /feature <what the bot should do>\nI'll save it for the next build session."
+        if len(command.request) > MAX_REQUEST_CHARS:
+            return f"That request is too long, the limit is {MAX_REQUEST_CHARS} characters."
+        # No await between the check and the update, so a burst can't slip through.
+        now = time.monotonic()
+        last = self._last_feature.get(msg.sender_id)
+        if last is not None and now - last < COOLDOWN_SECONDS:
+            return f"You can send one request every {COOLDOWN_SECONDS // 60} minutes, try again later."
+        self._last_feature[msg.sender_id] = now
+        try:
+            issue = await self.issues.create(
+                issue_title(command.request), issue_body(command.request, msg.sender_name), [FEATURE_LABEL]
+            )
+        except GitHubError as e:
+            # It may have been saved anyway, for example when only the response timed out.
+            log.error("Filing a feature request failed: %s", e)
+            return (
+                "Sorry, I couldn't confirm that your request was saved. "
+                f"Check the open requests before sending it again:\n{self.issues.requests_url}"
+            )
+        if FEATURE_LABEL not in issue.labels:
+            log.error("Issue #%d was created without the %s label", issue.number, FEATURE_LABEL)
+            return f"Saved as #{issue.number}, but without its label, so tell the maintainer.\n{issue.url}"
+        return f"Saved as #{issue.number} for the next build session to review. It's public.\n{issue.url}"
 
     @property
     def reaction_rules(self) -> tuple[ReactionRule, ...]:
